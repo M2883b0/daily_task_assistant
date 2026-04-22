@@ -1,0 +1,19 @@
+# 仅上传默认配置；其余 data 与日志为本地运行时数据
+data/*
+!data/settings.default.json
+logs/
+
+# 本地目标备忘（非程序必需）
+everydayTarget.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+dist/
+build/
