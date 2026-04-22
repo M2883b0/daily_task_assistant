@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox
 
 DATE_FMT = "%Y-%m-%d"
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
-LOG_FLUSH_INTERVAL_MS = 60 * 1000
+LOG_FLUSH_INTERVAL_MS = 3 * 1000
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -789,6 +789,7 @@ class DailyTaskAssistant:
     def _load_tasks_for_today(self) -> None:
         if self.today_file.exists():
             self.tasks = self._read_tasks_file(self.today_file)
+            self._sort_tasks()
             self._record_status("已加载今日任务文件")
             return
 
@@ -812,6 +813,7 @@ class DailyTaskAssistant:
                 if not item.done
             ]
             self.tasks.extend(carry_over)
+            self._sort_tasks()
 
             if carry_over:
                 self._append_event(
@@ -826,6 +828,7 @@ class DailyTaskAssistant:
         else:
             self._record_status("未找到昨天任务文件，已创建新的一天")
 
+        self._sort_tasks()
         self._save_today_tasks()
 
     def _archive_yesterday(self, day: str, tasks: list[TaskItem]) -> None:
@@ -854,6 +857,7 @@ class DailyTaskAssistant:
             source_day=self.today,
         )
         self.tasks.append(new_task)
+        self._sort_tasks()
         self.task_entry.delete(0, tk.END)
         self._save_today_tasks()
         self._append_event("task_added", {"task": asdict(new_task)})
@@ -962,6 +966,7 @@ class DailyTaskAssistant:
             return
         is_done = self.task_vars[task_id].get()
         task.done = is_done
+        self._sort_tasks()
         self._save_today_tasks()
         self._append_event(
             "task_toggled",
@@ -971,10 +976,7 @@ class DailyTaskAssistant:
                 "done": task.done,
             },
         )
-        self._refresh_task_style(task)
-        c = self.task_done_canvases.get(task_id)
-        if c is not None:
-            self._paint_task_done_toggle_canvas(c, task.done)
+        self._refresh_task_list()
         self._record_status("任务状态已更新")
 
     def _paint_task_done_toggle_canvas(self, c: tk.Canvas, done: bool) -> None:
@@ -1063,7 +1065,7 @@ class DailyTaskAssistant:
                     bd=0,
                     font=UI_FONT,
                 )
-                edit_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8), pady=6, ipady=6)
+                edit_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 36), pady=6, ipady=6)
                 edit_entry.insert(0, task.text)
                 edit_entry.select_range(0, tk.END)
                 edit_entry.focus_set()
@@ -1079,7 +1081,7 @@ class DailyTaskAssistant:
                     anchor="w",
                     font=UI_FONT,
                 )
-                text_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8), pady=8)
+                text_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 36), pady=8)
                 text_label.bind("<Double-1>", lambda _event, tid=task.id: self._start_inline_edit(tid))
                 self.task_text_labels[task.id] = text_label
                 self._refresh_task_style(task)
@@ -1137,6 +1139,7 @@ class DailyTaskAssistant:
 
         old_text = task.text
         task.text = new_text
+        self._sort_tasks()
         self._save_today_tasks()
         self._append_event(
             "task_edited",
@@ -1155,6 +1158,7 @@ class DailyTaskAssistant:
         if task is None:
             return
         self.tasks = [t for t in self.tasks if t.id != task_id]
+        self._sort_tasks()
         self._save_today_tasks()
         self._append_event(
             "task_deleted",
@@ -1171,21 +1175,34 @@ class DailyTaskAssistant:
 
     def _bind_delete_button_hover(self, row: tk.Frame, del_btn: ttk.Button) -> None:
         def show_btn(_event=None) -> None:
-            if not del_btn.winfo_manager():
-                del_btn.pack(side=tk.RIGHT, padx=(4, 8), pady=6)
+            self._set_task_row_hover(row, is_hover=True)
+            if del_btn.winfo_manager() != "place":
+                del_btn.place(relx=1.0, rely=0.5, anchor="e", x=-8)
+            del_btn.lift()
 
         def hide_btn(_event=None) -> None:
             pointer_widget = row.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
             if pointer_widget is not None and self._is_descendant_of(pointer_widget, row):
                 return
-            if del_btn.winfo_manager():
-                del_btn.pack_forget()
+            self._set_task_row_hover(row, is_hover=False)
+            if del_btn.winfo_manager() == "place":
+                del_btn.place_forget()
 
         row.bind("<Enter>", show_btn)
         row.bind("<Leave>", hide_btn)
         for child in row.winfo_children():
             child.bind("<Enter>", show_btn)
             child.bind("<Leave>", hide_btn)
+        self._set_task_row_hover(row, is_hover=False)
+
+    def _set_task_row_hover(self, row: tk.Frame, is_hover: bool) -> None:
+        bg = APP_THEME["bg_elevated"] if is_hover else APP_THEME["bg_row"]
+        row.configure(bg=bg)
+        for child in row.winfo_children():
+            try:
+                child.configure(bg=bg)
+            except tk.TclError:
+                continue
 
     def _is_descendant_of(self, widget: tk.Widget, parent: tk.Widget) -> bool:
         current = widget
@@ -1220,6 +1237,15 @@ class DailyTaskAssistant:
         except Exception as exc:
             messagebox.showerror("读取失败", f"任务文件读取失败：{exc}")
             return []
+
+    def _task_created_ts(self, task: TaskItem) -> float:
+        try:
+            return datetime.strptime(task.created_at, TIME_FMT).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _sort_tasks(self) -> None:
+        self.tasks.sort(key=lambda task: (1 if task.done else 0, -self._task_created_ts(task)))
 
     def _append_event(self, event_type: str, data: dict) -> None:
         event = {
