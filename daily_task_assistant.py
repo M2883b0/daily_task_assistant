@@ -109,6 +109,7 @@ class DailyTaskAssistant:
         self._log_refresh_after_id = None
         self._weekly_tasks_plain = ""
         self._log_week_key_by_label: dict[str, str] = {}
+        self._draft_search_visible = False
 
         self._build_ui()
         self._load_tasks_for_today()
@@ -204,10 +205,14 @@ class DailyTaskAssistant:
             font=UI_FONT,
             padx=10,
             pady=10,
+            undo=True,
+            autoseparators=True,
+            maxundo=-1,
         )
         self.draft_text.pack(fill=tk.BOTH, expand=True)
         self.draft_text.insert("1.0", self._load_draft_text())
         self.draft_text.bind("<KeyRelease>", self._schedule_draft_save)
+        self._setup_draft_editor_features(draft_frame)
 
         list_container = ttk.Frame(self.tasks_tab, style="Main.TFrame")
         list_container.pack(fill=tk.BOTH, expand=True)
@@ -559,6 +564,230 @@ class DailyTaskAssistant:
         self.draft_text.insert("1.0", formatted)
         self._save_draft_text()
         self._record_status("草稿 JSON 已格式化")
+
+    def _setup_draft_editor_features(self, draft_frame: ttk.Frame) -> None:
+        th = APP_THEME
+
+        # 默认隐藏：仅快捷键触发显示
+        self._draft_search_frame = ttk.Frame(draft_frame, style="Main.TFrame")
+
+        self._draft_find_var = tk.StringVar()
+        self._draft_replace_var = tk.StringVar()
+
+        # 查找/替换行布局（不显示按钮也可用，但按钮对鼠标友好）
+        row1 = ttk.Frame(self._draft_search_frame, style="Main.TFrame")
+        row1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(row1, text="查找", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._draft_find_entry = ttk.Entry(row1, textvariable=self._draft_find_var)
+        self._draft_find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row1, text="上一个", style="Secondary.TButton", command=lambda: self._draft_find_next(backward=True)).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(row1, text="下一个", style="Secondary.TButton", command=lambda: self._draft_find_next(backward=False)).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(row1, text="关闭", style="Secondary.TButton", command=self._hide_draft_search).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        row2 = ttk.Frame(self._draft_search_frame, style="Main.TFrame")
+        row2.pack(fill=tk.X)
+        ttk.Label(row2, text="替换", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self._draft_replace_entry = ttk.Entry(row2, textvariable=self._draft_replace_var)
+        self._draft_replace_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row2, text="替换", style="Secondary.TButton", command=self._draft_replace_one).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(row2, text="全部替换", style="Secondary.TButton", command=self._draft_replace_all).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        # 高亮样式
+        try:
+            self.draft_text.tag_configure(
+                "draft_find_match",
+                background=th["accent"],
+                foreground=th["fg"],
+            )
+        except tk.TclError:
+            pass
+        try:
+            self.draft_text.tag_configure(
+                "draft_find_current",
+                background=th["accent_hover"],
+                foreground=th["fg"],
+            )
+        except tk.TclError:
+            pass
+
+        # 撤回/重做
+        self.draft_text.bind("<Control-z>", lambda _e: self._draft_undo())
+        self.draft_text.bind("<Control-y>", lambda _e: self._draft_redo())
+        self.draft_text.bind("<Control-Shift-Z>", lambda _e: self._draft_redo())
+
+        # 查找/替换（默认不显示，快捷键唤出）
+        self.draft_text.bind("<Control-f>", lambda _e: self._show_draft_search(mode="find"))
+        self.draft_text.bind("<Control-h>", lambda _e: self._show_draft_search(mode="replace"))
+        self.draft_text.bind("<Escape>", lambda _e: self._hide_draft_search())
+
+        # 在查找框里按回车定位下一个；Shift+Enter 上一个；Esc 关闭
+        self._draft_find_entry.bind("<Return>", lambda _e: self._draft_find_next(backward=False))
+        self._draft_find_entry.bind("<Shift-Return>", lambda _e: self._draft_find_next(backward=True))
+        self._draft_find_entry.bind("<Escape>", lambda _e: self._hide_draft_search())
+        self._draft_replace_entry.bind("<Escape>", lambda _e: self._hide_draft_search())
+
+        # 输入查找词时动态高亮
+        self._draft_find_var.trace_add("write", lambda *_a: self._draft_highlight_all_matches())
+
+        # 让撤回栈更自然：每次按键结束切一个分隔点
+        self.draft_text.bind("<KeyRelease>", lambda _e: self._draft_mark_undo_separator(), add=True)
+
+    def _draft_mark_undo_separator(self) -> None:
+        try:
+            self.draft_text.edit_separator()
+        except tk.TclError:
+            pass
+
+    def _draft_undo(self) -> str:
+        try:
+            self.draft_text.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _draft_redo(self) -> str:
+        try:
+            self.draft_text.edit_redo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _show_draft_search(self, mode: str = "find") -> str:
+        if not hasattr(self, "_draft_search_frame"):
+            return "break"
+        if not self._draft_search_visible:
+            self._draft_search_frame.pack(fill=tk.X, pady=(0, 6), before=self.draft_text)
+            self._draft_search_visible = True
+        # 默认同步当前选区到查找框（更像编辑器）
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                sel = self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+                if sel and sel.strip():
+                    self._draft_find_var.set(sel)
+        except tk.TclError:
+            pass
+        if mode == "replace":
+            self._draft_replace_entry.focus_set()
+            self._draft_replace_entry.icursor(tk.END)
+        else:
+            self._draft_find_entry.focus_set()
+            self._draft_find_entry.icursor(tk.END)
+            self._draft_find_entry.select_range(0, tk.END)
+        self._draft_highlight_all_matches()
+        return "break"
+
+    def _hide_draft_search(self) -> str:
+        if getattr(self, "_draft_search_visible", False) and hasattr(self, "_draft_search_frame"):
+            self._draft_search_frame.pack_forget()
+            self._draft_search_visible = False
+        self._draft_clear_search_highlight()
+        try:
+            self.draft_text.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _draft_clear_search_highlight(self) -> None:
+        try:
+            self.draft_text.tag_remove("draft_find_match", "1.0", tk.END)
+            self.draft_text.tag_remove("draft_find_current", "1.0", tk.END)
+        except tk.TclError:
+            pass
+
+    def _draft_highlight_all_matches(self) -> None:
+        needle = (self._draft_find_var.get() if hasattr(self, "_draft_find_var") else "").strip()
+        self._draft_clear_search_highlight()
+        if not needle:
+            return
+        start = "1.0"
+        try:
+            while True:
+                idx = self.draft_text.search(needle, start, stopindex=tk.END, nocase=False)
+                if not idx:
+                    break
+                end = f"{idx}+{len(needle)}c"
+                self.draft_text.tag_add("draft_find_match", idx, end)
+                start = end
+        except tk.TclError:
+            return
+
+    def _draft_find_next(self, backward: bool = False) -> str:
+        needle = (self._draft_find_var.get() if hasattr(self, "_draft_find_var") else "").strip()
+        if not needle:
+            return "break"
+
+        try:
+            cur = self.draft_text.index(tk.INSERT)
+        except tk.TclError:
+            cur = "1.0"
+
+        self.draft_text.tag_remove("draft_find_current", "1.0", tk.END)
+
+        try:
+            if backward:
+                idx = self.draft_text.search(needle, cur, stopindex="1.0", backwards=True, nocase=False)
+                if not idx:
+                    idx = self.draft_text.search(needle, tk.END, stopindex="1.0", backwards=True, nocase=False)
+            else:
+                idx = self.draft_text.search(needle, f"{cur}+1c", stopindex=tk.END, nocase=False)
+                if not idx:
+                    idx = self.draft_text.search(needle, "1.0", stopindex=tk.END, nocase=False)
+            if not idx:
+                return "break"
+            end = f"{idx}+{len(needle)}c"
+            self.draft_text.tag_add("draft_find_current", idx, end)
+            self.draft_text.mark_set(tk.INSERT, end)
+            self.draft_text.see(idx)
+            self.draft_text.tag_remove(tk.SEL, "1.0", tk.END)
+            self.draft_text.tag_add(tk.SEL, idx, end)
+        except tk.TclError:
+            return "break"
+        return "break"
+
+    def _draft_replace_one(self) -> str:
+        needle = (self._draft_find_var.get() if hasattr(self, "_draft_find_var") else "").strip()
+        repl = self._draft_replace_var.get() if hasattr(self, "_draft_replace_var") else ""
+        if not needle:
+            return "break"
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                sel = self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+                if sel == needle:
+                    self.draft_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    self.draft_text.insert(tk.INSERT, repl)
+                    self._draft_mark_undo_separator()
+            self._draft_find_next(backward=False)
+            self._draft_highlight_all_matches()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _draft_replace_all(self) -> str:
+        needle = (self._draft_find_var.get() if hasattr(self, "_draft_find_var") else "").strip()
+        repl = self._draft_replace_var.get() if hasattr(self, "_draft_replace_var") else ""
+        if not needle:
+            return "break"
+        try:
+            content = self.draft_text.get("1.0", tk.END)
+            new_content = content.replace(needle, repl)
+            if new_content != content:
+                self.draft_text.delete("1.0", tk.END)
+                self.draft_text.insert("1.0", new_content)
+                self._draft_mark_undo_separator()
+            self._draft_highlight_all_matches()
+        except tk.TclError:
+            pass
+        return "break"
 
     def _start_window_drag(self, event) -> None:
         self._drag_start_x = event.x_root
@@ -1014,6 +1243,13 @@ class DailyTaskAssistant:
             return None
         if not self.root.winfo_viewable():
             return None
+        # 在任何可编辑输入控件中输入字符时，不触发“聚焦任务输入框”，避免草稿等页面输入 '/' 被打断
+        try:
+            w = event.widget
+            if isinstance(w, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox)):
+                return None
+        except Exception:
+            pass
         if self.inline_editing_task_id is not None:
             return "break"
         expected = str(self.settings.get("focus_input_key", "/")).strip().lower()
