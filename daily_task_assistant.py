@@ -539,6 +539,19 @@ class DailyTaskAssistant:
             return
         try:
             obj = json.loads(raw)
+            # 支持“JSON 字符串”场景：例如内容是 "\"{\\\"a\\\":1}\"" 这种被引号包裹的 JSON
+            # 最多解两层，避免误伤普通字符串或陷入异常循环
+            for _ in range(2):
+                if not isinstance(obj, str):
+                    break
+                s = obj.strip()
+                if not s:
+                    break
+                try:
+                    obj2 = json.loads(s)
+                except json.JSONDecodeError:
+                    break
+                obj = obj2
             formatted = json.dumps(obj, ensure_ascii=False, indent=2)
         except json.JSONDecodeError:
             return
@@ -600,14 +613,26 @@ class DailyTaskAssistant:
         selected_day = self.log_day_var.get().strip()
         tasks = self._get_tasks_for_day(selected_day)
         lines = self._format_tasks_lines(selected_day, tasks)
-        self._set_log_text("\n".join(lines))
+        self._set_log_text("\n".join(lines), preserve_view=False)
         self._weekly_tasks_plain = ""
         self._update_weekly_prompt_preview("")
 
-    def _set_log_text(self, content: str) -> None:
+    def _set_log_text(self, content: str, preserve_view: bool = True) -> None:
+        # 自动刷新时尽量保留滚动位置，避免“回到第一页”的观感
+        y0 = None
+        if preserve_view:
+            try:
+                y0 = self.log_text.yview()[0]
+            except tk.TclError:
+                y0 = None
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert("1.0", content)
+        if y0 is not None:
+            try:
+                self.log_text.yview_moveto(y0)
+            except tk.TclError:
+                pass
         self.log_text.configure(state=tk.DISABLED)
 
     def _apply_log_mode_layout(self) -> None:
@@ -668,7 +693,7 @@ class DailyTaskAssistant:
         key = self._log_week_key_by_label.get(label)
         if not key:
             self._weekly_tasks_plain = ""
-            self._set_log_text("暂无周数据，请先选择自然周。")
+            self._set_log_text("暂无周数据，请先选择自然周。", preserve_view=False)
             self._update_weekly_prompt_preview("")
             return
         mon_str, sun_str = key.split("|", 1)
@@ -687,7 +712,7 @@ class DailyTaskAssistant:
             plain_parts.append("")
             cur += timedelta(days=1)
         self._weekly_tasks_plain = "\n".join(plain_parts).strip()
-        self._set_log_text("\n".join(all_lines).rstrip())
+        self._set_log_text("\n".join(all_lines).rstrip(), preserve_view=False)
         try:
             full_prompt = self._get_weekly_prompt_template().format(tasks_block=self._weekly_tasks_plain)
         except (KeyError, ValueError):
@@ -766,6 +791,41 @@ class DailyTaskAssistant:
                     dates.add(day)
         return sorted(dates, reverse=True)
 
+    def _is_day_archived(self, day: str) -> bool:
+        if not self.daily_archive_log_file.exists():
+            return False
+        try:
+            # 从后往前找，通常更快命中最近日期
+            for line in reversed(self.daily_archive_log_file.read_text(encoding="utf-8").splitlines()):
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "daily_archive" and obj.get("day") == day:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _find_latest_task_day_before(self, day: str) -> str | None:
+        """找到 day 之前最近一个存在 tasks_YYYY-MM-DD.json 的日期。"""
+        try:
+            target = datetime.strptime(day, DATE_FMT).date()
+        except (TypeError, ValueError):
+            return None
+        candidates: list[str] = []
+        for path in self.data_dir.glob("tasks_*.json"):
+            name = path.stem.replace("tasks_", "", 1)
+            if len(name) != 10:
+                continue
+            try:
+                d = datetime.strptime(name, DATE_FMT).date()
+            except (TypeError, ValueError):
+                continue
+            if d < target:
+                candidates.append(name)
+        return max(candidates) if candidates else None
+
     def _get_tasks_for_day(self, day: str) -> list[dict]:
         day_file = self.data_dir / f"tasks_{day}.json"
         if day_file.exists():
@@ -795,11 +855,20 @@ class DailyTaskAssistant:
 
         self.tasks = []
         yesterday_date = (datetime.now() - timedelta(days=1)).strftime(DATE_FMT)
-        yesterday_file = self.data_dir / f"tasks_{yesterday_date}.json"
+        last_day = None
+        last_file = self.data_dir / f"tasks_{yesterday_date}.json"
+        if last_file.exists():
+            last_day = yesterday_date
+        else:
+            # 周末/节假日可能没打开应用 → 没有生成文件；回溯到最近一次有记录的日期
+            last_day = self._find_latest_task_day_before(self.today)
+            last_file = self.data_dir / f"tasks_{last_day}.json" if last_day else None
 
-        if yesterday_file.exists():
-            yesterday_tasks = self._read_tasks_file(yesterday_file)
-            self._archive_yesterday(yesterday_date, yesterday_tasks)
+        if last_day and last_file and last_file.exists():
+            last_tasks = self._read_tasks_file(last_file)
+            # 避免重复归档同一天（例如反复启动应用但未生成新一天文件时）
+            if not self._is_day_archived(last_day):
+                self._archive_yesterday(last_day, last_tasks)
 
             carry_over = [
                 TaskItem(
@@ -807,9 +876,9 @@ class DailyTaskAssistant:
                     text=item.text,
                     done=False,
                     created_at=datetime.now().strftime(TIME_FMT),
-                    source_day=yesterday_date,
+                    source_day=last_day,
                 )
-                for item in yesterday_tasks
+                for item in last_tasks
                 if not item.done
             ]
             self.tasks.extend(carry_over)
@@ -817,16 +886,19 @@ class DailyTaskAssistant:
 
             if carry_over:
                 self._append_event(
-                    "carry_over_from_yesterday",
+                    "carry_over_from_previous_day",
                     {
-                        "from_day": yesterday_date,
+                        "from_day": last_day,
                         "carried_count": len(carry_over),
                         "task_texts": [item.text for item in carry_over],
                     },
                 )
-            self._record_status(f"已继承昨天未完成任务 {len(carry_over)} 项")
+            if last_day != yesterday_date:
+                self._record_status(f"已从最近记录日 {last_day} 继承未完成任务 {len(carry_over)} 项")
+            else:
+                self._record_status(f"已继承昨天未完成任务 {len(carry_over)} 项")
         else:
-            self._record_status("未找到昨天任务文件，已创建新的一天")
+            self._record_status("未找到历史任务文件，已创建新的一天")
 
         self._sort_tasks()
         self._save_today_tasks()
@@ -1441,15 +1513,7 @@ class DailyTaskAssistant:
         if st in ("withdrawn", "iconic"):
             self._activate_window_front()
             return
-        try:
-            focused = self.root.focus_get()
-            in_app = focused is not None and focused.winfo_toplevel() == self.root
-        except tk.TclError:
-            in_app = False
-        if in_app:
-            self.root.withdraw()
-        else:
-            self._activate_window_front()
+        self.root.withdraw()
 
     def _activate_window_front(self) -> None:
         if self.root.state() == "withdrawn":
@@ -1460,20 +1524,11 @@ class DailyTaskAssistant:
         self.root.lift()
         try:
             self.root.attributes("-topmost", True)
-            self.root.after(80, lambda: self._clear_topmost_if_alive())
         except tk.TclError:
             pass
         self.root.focus_force()
         self.notebook.select(self.tasks_tab)
         self.task_entry.focus_set()
-
-    def _clear_topmost_if_alive(self) -> None:
-        if not self.root.winfo_exists():
-            return
-        try:
-            self.root.attributes("-topmost", False)
-        except tk.TclError:
-            pass
 
     def _unregister_global_hotkey(self) -> None:
         if self.hotkey_listener_thread_id is not None:
@@ -1619,6 +1674,7 @@ class DailyTaskAssistant:
     def _setup_window_appearance(self) -> None:
         self.root.configure(bg=APP_THEME["bg_root"])
         self.root.attributes("-alpha", self._clamp_window_alpha(self.settings.get("window_alpha", 0.88)))
+        self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
         self.root.after(10, self._try_enable_windows_blur)
 
