@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -110,6 +111,12 @@ class DailyTaskAssistant:
         self._weekly_tasks_plain = ""
         self._log_week_key_by_label: dict[str, str] = {}
         self._draft_search_visible = False
+        self._draft_source = ""
+        self._draft_refreshing = False
+        self._draft_force_raw = False
+        self._draft_last_nav_line: int | None = None
+        self._draft_return_press_col: int | None = None
+        self._draft_markdown_return_handled: bool = False
 
         self._build_ui()
         self._load_tasks_for_today()
@@ -187,12 +194,44 @@ class DailyTaskAssistant:
             command=self._draft_format_json,
             style="Secondary.TButton",
         ).pack(side=tk.LEFT)
+        ttk.Label(draft_toolbar, text="显示", style="Status.TLabel").pack(side=tk.LEFT, padx=(16, 4))
+        self._draft_view_mode_var = tk.StringVar(value="markdown")
+        self._draft_md_mode_radio = ttk.Radiobutton(
+            draft_toolbar,
+            text="Markdown",
+            variable=self._draft_view_mode_var,
+            value="markdown",
+            command=self._apply_draft_view_mode_from_toolbar,
+            style="App.TRadiobutton",
+        )
+        self._draft_md_mode_radio.pack(side=tk.LEFT)
+        self._draft_src_mode_radio = ttk.Radiobutton(
+            draft_toolbar,
+            text="源码",
+            variable=self._draft_view_mode_var,
+            value="source",
+            command=self._apply_draft_view_mode_from_toolbar,
+            style="App.TRadiobutton",
+        )
+        self._draft_src_mode_radio.pack(side=tk.LEFT, padx=(6, 0))
 
         draft_frame = ttk.Frame(self.draft_tab, style="Main.TFrame")
         draft_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        ttk.Label(draft_frame, text="草稿区（不记录日志）", style="Status.TLabel").pack(anchor=tk.W, pady=(0, 4))
+        draft_title_row = ttk.Frame(draft_frame, style="Main.TFrame")
+        draft_title_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(draft_title_row, text="草稿区（Markdown：光标所在行为源码，其余行实时渲染）", style="Status.TLabel").pack(
+            side=tk.LEFT
+        )
+
+        draft_stats_row = ttk.Frame(draft_frame, style="Main.TFrame")
+        draft_stats_row.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
+        self.draft_stats_label = ttk.Label(draft_stats_row, text="源码字数：0  选中：0", style="Status.TLabel")
+        self.draft_stats_label.pack(side=tk.RIGHT)
+
+        editor_panel = ttk.Frame(draft_frame, style="Main.TFrame")
+        editor_panel.pack(fill=tk.BOTH, expand=True)
         self.draft_text = tk.Text(
-            draft_frame,
+            editor_panel,
             height=16,
             bg=th["bg_elevated"],
             fg=th["fg"],
@@ -205,14 +244,17 @@ class DailyTaskAssistant:
             font=UI_FONT,
             padx=10,
             pady=10,
+            wrap="word",
             undo=True,
             autoseparators=True,
             maxundo=-1,
         )
         self.draft_text.pack(fill=tk.BOTH, expand=True)
-        self.draft_text.insert("1.0", self._load_draft_text())
-        self.draft_text.bind("<KeyRelease>", self._schedule_draft_save)
-        self._setup_draft_editor_features(draft_frame)
+        self._draft_source = self._load_draft_text()
+        self._configure_draft_markdown_tags(self.draft_text)
+        self._setup_draft_editor_features(editor_panel)
+        self._draft_refresh_view()
+        self._update_draft_stats()
 
         list_container = ttk.Frame(self.tasks_tab, style="Main.TFrame")
         list_container.pack(fill=tk.BOTH, expand=True)
@@ -539,13 +581,16 @@ class DailyTaskAssistant:
         self._write_settings_file()
 
     def _draft_format_json(self) -> None:
-        raw = self.draft_text.get("1.0", tk.END).strip()
+        try:
+            cur_ln = int(self.draft_text.index("insert").split(".")[0])
+        except tk.TclError:
+            cur_ln = 1
+        self._draft_sync_line_at(cur_ln)
+        raw = self._draft_source.strip()
         if not raw:
             return
         try:
             obj = json.loads(raw)
-            # 支持“JSON 字符串”场景：例如内容是 "\"{\\\"a\\\":1}\"" 这种被引号包裹的 JSON
-            # 最多解两层，避免误伤普通字符串或陷入异常循环
             for _ in range(2):
                 if not isinstance(obj, str):
                     break
@@ -560,21 +605,359 @@ class DailyTaskAssistant:
             formatted = json.dumps(obj, ensure_ascii=False, indent=2)
         except json.JSONDecodeError:
             return
-        self.draft_text.delete("1.0", tk.END)
-        self.draft_text.insert("1.0", formatted)
+        self._draft_source = formatted
+        self._draft_force_raw = True
+        if hasattr(self, "_draft_view_mode_var"):
+            self._draft_view_mode_var.set("source")
+        self._draft_refresh_view()
         self._save_draft_text()
+        self._update_draft_stats()
         self._record_status("草稿 JSON 已格式化")
+
+    def _apply_draft_view_mode_from_toolbar(self) -> None:
+        """工具栏「Markdown / 源码」切换，对应 Typora 的视图切换。"""
+        if getattr(self, "_draft_search_visible", False):
+            return
+        mode = self._draft_view_mode_var.get()
+        if mode == "source":
+            try:
+                ln = int(self.draft_text.index("insert").split(".")[0])
+                self._draft_sync_line_at(ln)
+            except tk.TclError:
+                pass
+            self._draft_force_raw = True
+            self._draft_refresh_view()
+        else:
+            if self._draft_force_raw:
+                self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._draft_force_raw = False
+            self._draft_refresh_view()
+        self._update_draft_stats()
+
+    def _configure_draft_markdown_tags(self, w: tk.Text) -> None:
+        # 标题分级字号；段前段后为 0，减轻与正文编辑行切换时的跳动（仍会比正文略高一行）
+        w.tag_configure(
+            "md_h1",
+            font=("Microsoft YaHei UI", 16, "bold"),
+            foreground=APP_THEME["fg"],
+            spacing1=0,
+            spacing3=0,
+        )
+        w.tag_configure(
+            "md_h2",
+            font=("Microsoft YaHei UI", 14, "bold"),
+            foreground=APP_THEME["fg"],
+            spacing1=0,
+            spacing3=0,
+        )
+        w.tag_configure(
+            "md_h3",
+            font=("Microsoft YaHei UI", 12, "bold"),
+            foreground=APP_THEME["fg_muted"],
+            spacing1=0,
+            spacing3=0,
+        )
+        w.tag_configure("md_quote", foreground=APP_THEME["fg_muted"], lmargin1=12, lmargin2=12)
+        w.tag_configure("md_list", lmargin1=10, lmargin2=22)
+        w.tag_configure("md_code_inline", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_code_block", background=APP_THEME["bg_elevated"], font=MONO_FONT, lmargin1=10, lmargin2=10)
+        w.tag_configure("md_code_fence", foreground=APP_THEME["fg_muted"], font=MONO_FONT)
+        w.tag_configure("md_bold", font=("Microsoft YaHei UI", 10, "bold"))
+        w.tag_configure("md_italic", font=("Microsoft YaHei UI", 10, "italic"))
+        w.tag_configure("md_strike", overstrike=1)
+        w.tag_configure("md_link", foreground=APP_THEME["accent"], underline=1)
+        w.tag_configure("md_hr", foreground=APP_THEME["fg_muted"])
+
+    def _insert_markdown_inline(self, widget: tk.Text, text: str, base_tags: tuple[str, ...] = ()) -> None:
+        token_re = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|~~[^~]+~~|\[[^\]]+\]\([^)]+\))")
+        pos = 0
+        for m in token_re.finditer(text):
+            if m.start() > pos:
+                widget.insert(tk.END, text[pos:m.start()], base_tags)
+            token = m.group(0)
+            tags = list(base_tags)
+            out = token
+            if token.startswith("`") and token.endswith("`"):
+                out = token[1:-1]
+                tags.append("md_code_inline")
+            elif token.startswith("**") and token.endswith("**"):
+                out = token[2:-2]
+                tags.append("md_bold")
+            elif token.startswith("*") and token.endswith("*"):
+                out = token[1:-1]
+                tags.append("md_italic")
+            elif token.startswith("~~") and token.endswith("~~"):
+                out = token[2:-2]
+                tags.append("md_strike")
+            elif token.startswith("[") and "](" in token and token.endswith(")"):
+                m2 = re.match(r"\[([^\]]+)\]\(([^)]+)\)", token)
+                if m2:
+                    out = f"{m2.group(1)} ({m2.group(2)})"
+                    tags.append("md_link")
+            widget.insert(tk.END, out, tuple(tags))
+            pos = m.end()
+        if pos < len(text):
+            widget.insert(tk.END, text[pos:], base_tags)
+
+    def _draft_append_rendered_markdown_line(self, w: tk.Text, line: str) -> None:
+        h = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if h:
+            level = min(len(h.group(1)), 3)
+            self._insert_markdown_inline(w, h.group(2), (f"md_h{level}",))
+            return
+        if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
+            w.insert(tk.END, "─" * 18, ("md_hr",))
+            return
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if quote:
+            w.insert(tk.END, "│ ", ("md_quote",))
+            self._insert_markdown_inline(w, quote.group(1), ("md_quote",))
+            return
+        ul = re.match(r"^\s*[-*+]\s+(.*)$", line)
+        if ul:
+            w.insert(tk.END, "• ", ("md_list",))
+            self._insert_markdown_inline(w, ul.group(1), ("md_list",))
+            return
+        ol = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+        if ol:
+            w.insert(tk.END, f"{ol.group(1)}. ", ("md_list",))
+            self._insert_markdown_inline(w, ol.group(2), ("md_list",))
+            return
+        self._insert_markdown_inline(w, line)
+
+    def _draft_sync_line_at(self, line_1based: int) -> None:
+        if self._draft_refreshing:
+            return
+        if self._draft_force_raw:
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            return
+        if line_1based < 1:
+            return
+        parts = self._draft_source.split("\n")
+        if line_1based > len(parts):
+            parts.extend([""] * (line_1based - len(parts)))
+        try:
+            raw = self.draft_text.get(f"{line_1based}.0", f"{line_1based}.end")
+        except tk.TclError:
+            return
+        parts[line_1based - 1] = raw
+        self._draft_source = "\n".join(parts)
+
+    def _draft_apply_source_line_break(self, line_1based: int, col: int) -> None:
+        """在内存 Markdown 源码上按列切分为两行；与 Tk 是否插入 \\n 无关，避免行号对齐启发式错位。"""
+        parts = self._draft_source.split("\n")
+        i = line_1based - 1
+        if i < 0:
+            return
+        while len(parts) <= i:
+            parts.append("")
+        s = parts[i]
+        c = max(0, min(int(col), len(s)))
+        left, right = s[:c], s[c:]
+        parts[i : i + 1] = [left, right]
+        self._draft_source = "\n".join(parts)
+
+    def _draft_ensure_source_line_count_from_widget(self) -> None:
+        """Text 逻辑行数多于 _draft_source 时补齐（例如粘贴多行）。回车换行改由 KeyPress 内直接改源码，不经此处。"""
+        if self._draft_force_raw:
+            return
+        try:
+            w_lines = int(self.draft_text.index("end-1c").split(".")[0])
+        except tk.TclError:
+            return
+        parts = self._draft_source.split("\n")
+        delta = w_lines - len(parts)
+        if delta <= 0:
+            return
+        parts.extend([""] * delta)
+        self._draft_source = "\n".join(parts)
+
+    def _draft_refresh_view(self, focus_line: int | None = None, focus_col: int | None = None) -> None:
+        if not hasattr(self, "draft_text"):
+            return
+        self._draft_refreshing = True
+        # 整页 delete/insert 若记入撤销栈，会占满栈、截断重做；程序化重绘不加入撤销/重做
+        try:
+            prev_undo = self.draft_text.cget("undo")
+        except tk.TclError:
+            prev_undo = True
+        try:
+            self.draft_text.configure(undo=False)
+            lines = self._draft_source.split("\n")
+            if not lines:
+                lines = [""]
+
+            if focus_line is not None:
+                line_no = max(1, min(int(focus_line), len(lines)))
+                lt = lines[line_no - 1]
+                col = 0 if focus_col is None else max(0, min(int(focus_col), len(lt)))
+            else:
+                try:
+                    idx = self.draft_text.index("insert")
+                    line_no = int(idx.split(".")[0])
+                    col = int(idx.split(".")[1])
+                except tk.TclError:
+                    line_no, col = 1, 0
+
+                line_no = max(1, min(line_no, len(lines)))
+                line_text = lines[line_no - 1]
+                col = max(0, min(col, len(line_text)))
+
+            self.draft_text.delete("1.0", "end")
+            in_code = False
+
+            for i, line in enumerate(lines):
+                lineno = i + 1
+                stripped = line.strip()
+                is_fence = stripped.startswith("```")
+                show_raw = self._draft_force_raw or (lineno == line_no)
+
+                if is_fence:
+                    in_code = not in_code
+                    if show_raw:
+                        self.draft_text.insert("end", line + "\n")
+                    else:
+                        self.draft_text.insert("end", line + "\n", ("md_code_fence",))
+                    continue
+
+                if show_raw:
+                    self.draft_text.insert("end", line + "\n")
+                    continue
+
+                if in_code:
+                    self.draft_text.insert("end", (line if line else " ") + "\n", ("md_code_block",))
+                    continue
+
+                self._draft_append_rendered_markdown_line(self.draft_text, line)
+                self.draft_text.insert("end", "\n")
+
+            self.draft_text.mark_set("insert", f"{line_no}.{col}")
+            self.draft_text.see("insert")
+            self._draft_last_nav_line = line_no
+        finally:
+            try:
+                self.draft_text.configure(undo=prev_undo)
+            except tk.TclError:
+                pass
+            self._draft_refreshing = False
+
+    def _draft_on_editor_key_release(self, event=None) -> None:
+        if self._draft_refreshing:
+            return
+        if self._draft_force_raw:
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._update_draft_stats()
+            self._schedule_draft_save()
+            return
+        ks = event.keysym if event is not None else ""
+        # Markdown 下 KeyPress-Return 已对源码拆行并重绘，勿再走 ensure/sync，否则会二次改写行结构（表现为吃掉相邻行）
+        if (
+            not self._draft_force_raw
+            and ks in ("Return", "KP_Enter")
+            and getattr(self, "_draft_markdown_return_handled", False)
+        ):
+            self._draft_markdown_return_handled = False
+            try:
+                cur = int(self.draft_text.index("insert").split(".")[0])
+            except tk.TclError:
+                return
+            self._draft_last_nav_line = cur
+            self._update_draft_stats()
+            self._schedule_draft_save()
+            self._draft_return_press_col = None
+            return
+        self._draft_ensure_source_line_count_from_widget()
+        try:
+            cur = int(self.draft_text.index("insert").split(".")[0])
+        except tk.TclError:
+            return
+        prev = self._draft_last_nav_line
+        if prev is None:
+            prev = cur
+        if prev != cur:
+            self._draft_sync_line_at(prev)
+            self._draft_last_nav_line = cur
+            self._draft_refresh_view()
+        else:
+            self._draft_sync_line_at(cur)
+            self._draft_last_nav_line = cur
+        self._update_draft_stats()
+        self._schedule_draft_save()
+        if ks in ("Return", "KP_Enter"):
+            self._draft_return_press_col = None
+
+    def _draft_on_editor_click(self, _event=None) -> None:
+        # 延后到 idle 再同步/重绘，避免点击瞬间与本次事件重入叠加造成闪动
+        self.root.after_idle(lambda: self._draft_on_editor_key_release(None))
+
+    def _draft_handle_return(self, _event=None) -> str | None:
+        if self._draft_force_raw:
+            self._draft_return_press_col = None
+            return None
+        self._draft_markdown_return_handled = False
+        try:
+            idx = self.draft_text.index("insert")
+            sp = idx.split(".")
+            col = int(sp[1])
+            ln = int(sp[0])
+        except tk.TclError:
+            self._draft_return_press_col = None
+            return None
+        self._draft_return_press_col = col
+        self._draft_sync_line_at(ln)
+        lines = self._draft_source.split("\n")
+        i = ln - 1
+        if i < 0 or i >= len(lines):
+            self._draft_return_press_col = None
+            return None
+        line = lines[i]
+
+        m_ul = re.match(r"^(\s*)([-*+])\s+(.*)$", line)
+        if m_ul:
+            indent, marker, rest = m_ul.group(1), m_ul.group(2), m_ul.group(3)
+            if rest.strip() == "":
+                lines[i] = indent
+                self._draft_source = "\n".join(lines)
+                self._draft_refresh_view(focus_line=ln, focus_col=len(indent))
+            else:
+                lines.insert(i + 1, f"{indent}{marker} ")
+                self._draft_source = "\n".join(lines)
+                new_ln = ln + 1
+                new_text = lines[new_ln - 1]
+                self._draft_refresh_view(focus_line=new_ln, focus_col=len(new_text))
+            self._draft_markdown_return_handled = True
+            return "break"
+
+        m_ol = re.match(r"^(\s*)(\d+)\.\s+(.*)$", line)
+        if m_ol:
+            indent, num_s, rest = m_ol.group(1), m_ol.group(2), m_ol.group(3)
+            if rest.strip() == "":
+                lines[i] = indent
+                self._draft_source = "\n".join(lines)
+                self._draft_refresh_view(focus_line=ln, focus_col=len(indent))
+            else:
+                n = int(num_s) + 1
+                lines.insert(i + 1, f"{indent}{n}. ")
+                self._draft_source = "\n".join(lines)
+                new_ln = ln + 1
+                new_text = lines[new_ln - 1]
+                self._draft_refresh_view(focus_line=new_ln, focus_col=len(new_text))
+            self._draft_markdown_return_handled = True
+            return "break"
+
+        self._draft_apply_source_line_break(ln, col)
+        self._draft_refresh_view(focus_line=ln + 1, focus_col=0)
+        self._draft_markdown_return_handled = True
+        return "break"
 
     def _setup_draft_editor_features(self, draft_frame: ttk.Frame) -> None:
         th = APP_THEME
 
-        # 默认隐藏：仅快捷键触发显示
         self._draft_search_frame = ttk.Frame(draft_frame, style="Main.TFrame")
 
         self._draft_find_var = tk.StringVar()
         self._draft_replace_var = tk.StringVar()
 
-        # 查找/替换行布局（不显示按钮也可用，但按钮对鼠标友好）
         row1 = ttk.Frame(self._draft_search_frame, style="Main.TFrame")
         row1.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(row1, text="查找", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 6))
@@ -602,7 +985,6 @@ class DailyTaskAssistant:
             side=tk.LEFT, padx=(6, 0)
         )
 
-        # 高亮样式
         try:
             self.draft_text.tag_configure(
                 "draft_find_match",
@@ -620,39 +1002,46 @@ class DailyTaskAssistant:
         except tk.TclError:
             pass
 
-        # 撤回/重做
         self.draft_text.bind("<Control-z>", lambda _e: self._draft_undo())
         self.draft_text.bind("<Control-y>", lambda _e: self._draft_redo())
         self.draft_text.bind("<Control-Shift-Z>", lambda _e: self._draft_redo())
 
-        # 查找/替换（默认不显示，快捷键唤出）
         self.draft_text.bind("<Control-f>", lambda _e: self._show_draft_search(mode="find"))
         self.draft_text.bind("<Control-h>", lambda _e: self._show_draft_search(mode="replace"))
-        self.draft_text.bind("<Escape>", lambda _e: self._hide_draft_search())
+        self.draft_text.bind("<Escape>", lambda _e: self._draft_escape_handler())
 
-        # 在查找框里按回车定位下一个；Shift+Enter 上一个；Esc 关闭
         self._draft_find_entry.bind("<Return>", lambda _e: self._draft_find_next(backward=False))
         self._draft_find_entry.bind("<Shift-Return>", lambda _e: self._draft_find_next(backward=True))
         self._draft_find_entry.bind("<Escape>", lambda _e: self._hide_draft_search())
         self._draft_replace_entry.bind("<Escape>", lambda _e: self._hide_draft_search())
 
-        # 输入查找词时动态高亮
         self._draft_find_var.trace_add("write", lambda *_a: self._draft_highlight_all_matches())
 
-        # 让撤回栈更自然：每次按键结束切一个分隔点
-        self.draft_text.bind("<KeyRelease>", lambda _e: self._draft_mark_undo_separator(), add=True)
+        self.draft_text.bind("<KeyPress-Return>", self._draft_handle_return)
+        self.draft_text.bind("<KeyPress-KP_Enter>", self._draft_handle_return)
 
-    def _draft_mark_undo_separator(self) -> None:
-        try:
-            self.draft_text.edit_separator()
-        except tk.TclError:
-            pass
+        self.draft_text.bind("<KeyRelease>", self._draft_on_editor_key_release, add=True)
+        self.draft_text.bind("<ButtonRelease-1>", lambda _e: self._draft_on_editor_click(), add=True)
+
+    def _draft_escape_handler(self) -> str | None:
+        if getattr(self, "_draft_search_visible", False):
+            return self._hide_draft_search()
+        return None
 
     def _draft_undo(self) -> str:
         try:
             self.draft_text.edit_undo()
         except tk.TclError:
             pass
+        if self._draft_force_raw:
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+        else:
+            try:
+                self._draft_sync_line_at(int(self.draft_text.index("insert").split(".")[0]))
+            except tk.TclError:
+                pass
+            self._draft_refresh_view()
+        self._update_draft_stats()
         return "break"
 
     def _draft_redo(self) -> str:
@@ -660,15 +1049,36 @@ class DailyTaskAssistant:
             self.draft_text.edit_redo()
         except tk.TclError:
             pass
+        if self._draft_force_raw:
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+        else:
+            try:
+                self._draft_sync_line_at(int(self.draft_text.index("insert").split(".")[0]))
+            except tk.TclError:
+                pass
+            self._draft_refresh_view()
+        self._update_draft_stats()
         return "break"
 
     def _show_draft_search(self, mode: str = "find") -> str:
         if not hasattr(self, "_draft_search_frame"):
             return "break"
+        if hasattr(self, "_draft_view_mode_var"):
+            self._draft_view_mode_before_search = self._draft_view_mode_var.get()
+        try:
+            cur_ln = int(self.draft_text.index("insert").split(".")[0])
+        except tk.TclError:
+            cur_ln = 1
+        self._draft_sync_line_at(cur_ln)
+        self._draft_force_raw = True
+        self._draft_refresh_view()
+
         if not self._draft_search_visible:
             self._draft_search_frame.pack(fill=tk.X, pady=(0, 6), before=self.draft_text)
             self._draft_search_visible = True
-        # 默认同步当前选区到查找框（更像编辑器）
+        if hasattr(self, "_draft_md_mode_radio"):
+            self._draft_md_mode_radio.configure(state="disabled")
+            self._draft_src_mode_radio.configure(state="disabled")
         try:
             if self.draft_text.tag_ranges(tk.SEL):
                 sel = self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST)
@@ -690,6 +1100,19 @@ class DailyTaskAssistant:
         if getattr(self, "_draft_search_visible", False) and hasattr(self, "_draft_search_frame"):
             self._draft_search_frame.pack_forget()
             self._draft_search_visible = False
+        self._draft_source = self.draft_text.get("1.0", "end-1c")
+        saved = getattr(self, "_draft_view_mode_before_search", None)
+        if saved is None and hasattr(self, "_draft_view_mode_var"):
+            saved = self._draft_view_mode_var.get()
+        if saved is None:
+            saved = "markdown"
+        if hasattr(self, "_draft_view_mode_var"):
+            self._draft_view_mode_var.set(saved)
+        self._draft_force_raw = saved == "source"
+        self._draft_refresh_view()
+        if hasattr(self, "_draft_md_mode_radio"):
+            self._draft_md_mode_radio.configure(state="normal")
+            self._draft_src_mode_radio.configure(state="normal")
         self._draft_clear_search_highlight()
         try:
             self.draft_text.focus_set()
@@ -765,9 +1188,11 @@ class DailyTaskAssistant:
                 if sel == needle:
                     self.draft_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
                     self.draft_text.insert(tk.INSERT, repl)
-                    self._draft_mark_undo_separator()
             self._draft_find_next(backward=False)
             self._draft_highlight_all_matches()
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._update_draft_stats()
+            self._schedule_draft_save()
         except tk.TclError:
             pass
         return "break"
@@ -783,11 +1208,37 @@ class DailyTaskAssistant:
             if new_content != content:
                 self.draft_text.delete("1.0", tk.END)
                 self.draft_text.insert("1.0", new_content)
-                self._draft_mark_undo_separator()
             self._draft_highlight_all_matches()
+            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._update_draft_stats()
+            self._schedule_draft_save()
         except tk.TclError:
             pass
         return "break"
+
+    def _update_draft_stats(self) -> None:
+        if not hasattr(self, "draft_stats_label"):
+            return
+        if getattr(self, "_draft_force_raw", False):
+            try:
+                content = self.draft_text.get("1.0", "end-1c")
+            except tk.TclError:
+                content = self._draft_source
+        else:
+            try:
+                ln = int(self.draft_text.index("insert").split(".")[0])
+                self._draft_sync_line_at(ln)
+            except tk.TclError:
+                pass
+            content = self._draft_source
+        char_count = len(re.sub(r"\s+", "", content))
+        selected_count = 0
+        try:
+            if hasattr(self, "draft_text") and self.draft_text.tag_ranges(tk.SEL):
+                selected_count = len(self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST))
+        except tk.TclError:
+            selected_count = 0
+        self.draft_stats_label.configure(text=f"源码字数：{char_count}  选中：{selected_count}")
 
     def _start_window_drag(self, event) -> None:
         self._drag_start_x = event.x_root
@@ -1576,13 +2027,19 @@ class DailyTaskAssistant:
             return ""
 
     def _save_draft_text(self) -> None:
+        if hasattr(self, "draft_text") and not getattr(self, "_draft_force_raw", False):
+            try:
+                ln = int(self.draft_text.index("insert").split(".")[0])
+                self._draft_sync_line_at(ln)
+            except tk.TclError:
+                pass
         try:
-            content = self.draft_text.get("1.0", tk.END).rstrip("\n")
-            self.draft_file.write_text(content, encoding="utf-8")
-        except Exception:
+            self.draft_file.write_text(self._draft_source.rstrip("\n"), encoding="utf-8")
+        except OSError:
             pass
 
     def _schedule_draft_save(self, _event=None) -> None:
+        self._update_draft_stats()
         if hasattr(self, "_draft_save_after_id") and self._draft_save_after_id is not None:
             self.root.after_cancel(self._draft_save_after_id)
         self._draft_save_after_id = self.root.after(800, self._save_draft_text)
@@ -1937,6 +2394,18 @@ class DailyTaskAssistant:
         style.configure("TLabel", background=bg_main, foreground=fg)
         style.configure("Title.TLabel", background=bg_main, foreground=fg)
         style.configure("Status.TLabel", background=bg_main, foreground=fg_muted, font=UI_FONT_SM)
+        style.configure(
+            "App.TRadiobutton",
+            background=bg_main,
+            foreground=fg,
+            font=UI_FONT_SM,
+            focuscolor=accent,
+        )
+        style.map(
+            "App.TRadiobutton",
+            background=[("active", bg_main), ("selected", bg_main)],
+            foreground=[("active", accent_h), ("selected", fg)],
+        )
 
         style.configure(
             "TButton",
