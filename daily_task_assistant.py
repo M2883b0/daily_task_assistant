@@ -1,6 +1,7 @@
 import json
 import re
 import difflib
+import time
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -115,6 +116,11 @@ class DailyTaskAssistant:
         self._draft_source = ""
         self._draft_refreshing = False
         self._draft_force_raw = False
+        self._draft_history: list[str] = []
+        self._draft_history_idx: int = -1
+        self._draft_history_restoring: bool = False
+        self._draft_history_last_change_ts: float = 0.0
+        self._draft_history_coalesce_window_s: float = 0.5
         self._draft_last_nav_line: int | None = None
         self._draft_active_raw_line: int | None = None
         self._draft_return_press_col: int | None = None
@@ -248,12 +254,15 @@ class DailyTaskAssistant:
             padx=10,
             pady=10,
             wrap="word",
-            undo=True,
-            autoseparators=True,
-            maxundo=-1,
+            undo=False,
+            autoseparators=False,
+            maxundo=0,
         )
         self.draft_text.pack(fill=tk.BOTH, expand=True)
         self._draft_source = self._load_draft_text()
+        self._draft_history = [self._draft_source]
+        self._draft_history_idx = 0
+        self._draft_history_last_change_ts = 0.0
         self._configure_draft_markdown_tags(self.draft_text)
         self._setup_draft_editor_features(editor_panel)
         self._draft_refresh_view()
@@ -608,7 +617,7 @@ class DailyTaskAssistant:
             formatted = json.dumps(obj, ensure_ascii=False, indent=2)
         except json.JSONDecodeError:
             return
-        self._draft_source = formatted
+        self._draft_set_source(formatted, coalesce=False)
         self._draft_force_raw = True
         if hasattr(self, "_draft_view_mode_var"):
             self._draft_view_mode_var.set("source")
@@ -632,7 +641,7 @@ class DailyTaskAssistant:
             self._draft_refresh_view()
         else:
             if self._draft_force_raw:
-                self._draft_source = self.draft_text.get("1.0", "end-1c")
+                self._draft_set_source(self.draft_text.get("1.0", "end-1c"))
             self._draft_force_raw = False
             self._draft_refresh_view()
         self._update_draft_stats()
@@ -732,7 +741,7 @@ class DailyTaskAssistant:
         if self._draft_refreshing:
             return
         if self._draft_force_raw:
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._draft_set_source(self.draft_text.get("1.0", "end-1c"), coalesce=False)
             return
         # 混合渲染模式下仅允许从“当前源码行”回写，避免把渲染文本覆盖进 Markdown 源码
         if line_1based != getattr(self, "_draft_active_raw_line", None):
@@ -747,9 +756,31 @@ class DailyTaskAssistant:
         except tk.TclError:
             return
         parts[line_1based - 1] = raw
-        self._draft_source = "\n".join(parts)
+        self._draft_set_source("\n".join(parts))
 
-    def _draft_apply_source_line_break(self, line_1based: int, col: int) -> None:
+    def _draft_set_source(self, new_source: str, *, record_history: bool = True, coalesce: bool = True) -> bool:
+        if new_source == self._draft_source:
+            return False
+        self._draft_source = new_source
+        if record_history and not self._draft_history_restoring:
+            if self._draft_history_idx < len(self._draft_history) - 1:
+                self._draft_history = self._draft_history[: self._draft_history_idx + 1]
+            now = time.monotonic()
+            can_coalesce = (
+                coalesce
+                and len(self._draft_history) >= 2
+                and self._draft_history_idx == len(self._draft_history) - 1
+                and (now - self._draft_history_last_change_ts) <= self._draft_history_coalesce_window_s
+            )
+            if can_coalesce:
+                self._draft_history[self._draft_history_idx] = new_source
+            else:
+                self._draft_history.append(new_source)
+                self._draft_history_idx = len(self._draft_history) - 1
+            self._draft_history_last_change_ts = now
+        return True
+
+    def _draft_apply_source_line_break(self, line_1based: int, col: int, *, coalesce: bool = True) -> None:
         """在内存 Markdown 源码上按列切分为两行；与 Tk 是否插入 \\n 无关，避免行号对齐启发式错位。"""
         parts = self._draft_source.split("\n")
         i = line_1based - 1
@@ -761,7 +792,7 @@ class DailyTaskAssistant:
         c = max(0, min(int(col), len(s)))
         left, right = s[:c], s[c:]
         parts[i : i + 1] = [left, right]
-        self._draft_source = "\n".join(parts)
+        self._draft_set_source("\n".join(parts), coalesce=coalesce)
 
     def _draft_ensure_source_line_count_from_widget(self) -> None:
         """Text 逻辑行数多于 _draft_source 时补齐（例如粘贴多行）。回车换行改由 KeyPress 内直接改源码，不经此处。"""
@@ -776,7 +807,7 @@ class DailyTaskAssistant:
         if delta <= 0:
             return
         parts.extend([""] * delta)
-        self._draft_source = "\n".join(parts)
+        self._draft_set_source("\n".join(parts))
 
     def _draft_source_offset_from_line_col(self, line_1based: int, col: int) -> int:
         parts = self._draft_source.split("\n")
@@ -933,7 +964,7 @@ class DailyTaskAssistant:
         if self._draft_refreshing:
             return
         if self._draft_force_raw:
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._draft_set_source(self.draft_text.get("1.0", "end-1c"), coalesce=False)
             try:
                 self.draft_text.edit_modified(False)
             except tk.TclError:
@@ -1059,11 +1090,11 @@ class DailyTaskAssistant:
             indent, marker, rest = m_ul.group(1), m_ul.group(2), m_ul.group(3)
             if rest.strip() == "":
                 lines[i] = indent
-                self._draft_source = "\n".join(lines)
+                self._draft_set_source("\n".join(lines), coalesce=False)
                 self._draft_refresh_view(focus_line=ln, focus_col=len(indent))
             else:
                 lines.insert(i + 1, f"{indent}{marker} ")
-                self._draft_source = "\n".join(lines)
+                self._draft_set_source("\n".join(lines), coalesce=False)
                 new_ln = ln + 1
                 new_text = lines[new_ln - 1]
                 self._draft_refresh_view(focus_line=new_ln, focus_col=len(new_text))
@@ -1075,19 +1106,19 @@ class DailyTaskAssistant:
             indent, num_s, rest = m_ol.group(1), m_ol.group(2), m_ol.group(3)
             if rest.strip() == "":
                 lines[i] = indent
-                self._draft_source = "\n".join(lines)
+                self._draft_set_source("\n".join(lines), coalesce=False)
                 self._draft_refresh_view(focus_line=ln, focus_col=len(indent))
             else:
                 n = int(num_s) + 1
                 lines.insert(i + 1, f"{indent}{n}. ")
-                self._draft_source = "\n".join(lines)
+                self._draft_set_source("\n".join(lines), coalesce=False)
                 new_ln = ln + 1
                 new_text = lines[new_ln - 1]
                 self._draft_refresh_view(focus_line=new_ln, focus_col=len(new_text))
             self._draft_markdown_return_handled = True
             return "break"
 
-        self._draft_apply_source_line_break(ln, col)
+        self._draft_apply_source_line_break(ln, col, coalesce=False)
         self._draft_refresh_view(focus_line=ln + 1, focus_col=0)
         self._draft_markdown_return_handled = True
         return "break"
@@ -1118,7 +1149,7 @@ class DailyTaskAssistant:
                 if src_start > src_end:
                     src_start, src_end = src_end, src_start
                 if src_end > src_start:
-                    self._draft_source = self._draft_source[:src_start] + self._draft_source[src_end:]
+                    self._draft_set_source(self._draft_source[:src_start] + self._draft_source[src_end:], coalesce=False)
                     focus_ln, focus_col = self._draft_source_line_col_from_offset(src_start)
                     self._draft_refresh_view(focus_line=focus_ln, focus_col=focus_col)
                     self._draft_markdown_delete_handled = True
@@ -1137,7 +1168,7 @@ class DailyTaskAssistant:
             prev_text = lines[i - 1]
             lines[i - 1] = prev_text + lines[i]
             del lines[i]
-            self._draft_source = "\n".join(lines)
+            self._draft_set_source("\n".join(lines), coalesce=False)
             self._draft_refresh_view(focus_line=ln - 1, focus_col=len(prev_text))
             self._draft_markdown_delete_handled = True
             return "break"
@@ -1145,7 +1176,7 @@ class DailyTaskAssistant:
         if ks == "Delete" and col == len(lines[i]) and ln < len(lines):
             lines[i] = lines[i] + lines[i + 1]
             del lines[i + 1]
-            self._draft_source = "\n".join(lines)
+            self._draft_set_source("\n".join(lines), coalesce=False)
             self._draft_refresh_view(focus_line=ln, focus_col=col)
             self._draft_markdown_delete_handled = True
             return "break"
@@ -1233,34 +1264,30 @@ class DailyTaskAssistant:
         return None
 
     def _draft_undo(self) -> str:
+        if self._draft_history_idx <= 0:
+            return "break"
+        self._draft_history_restoring = True
         try:
-            self.draft_text.edit_undo()
-        except tk.TclError:
-            pass
-        if self._draft_force_raw:
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
-        else:
-            try:
-                self._draft_sync_line_at(int(self.draft_text.index("insert").split(".")[0]))
-            except tk.TclError:
-                pass
-            self._draft_refresh_view()
+            self._draft_history_idx -= 1
+            self._draft_source = self._draft_history[self._draft_history_idx]
+        finally:
+            self._draft_history_restoring = False
+        self._draft_history_last_change_ts = 0.0
+        self._draft_refresh_view()
         self._update_draft_stats()
         return "break"
 
     def _draft_redo(self) -> str:
+        if self._draft_history_idx >= len(self._draft_history) - 1:
+            return "break"
+        self._draft_history_restoring = True
         try:
-            self.draft_text.edit_redo()
-        except tk.TclError:
-            pass
-        if self._draft_force_raw:
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
-        else:
-            try:
-                self._draft_sync_line_at(int(self.draft_text.index("insert").split(".")[0]))
-            except tk.TclError:
-                pass
-            self._draft_refresh_view()
+            self._draft_history_idx += 1
+            self._draft_source = self._draft_history[self._draft_history_idx]
+        finally:
+            self._draft_history_restoring = False
+        self._draft_history_last_change_ts = 0.0
+        self._draft_refresh_view()
         self._update_draft_stats()
         return "break"
 
@@ -1304,7 +1331,7 @@ class DailyTaskAssistant:
         if getattr(self, "_draft_search_visible", False) and hasattr(self, "_draft_search_frame"):
             self._draft_search_frame.pack_forget()
             self._draft_search_visible = False
-        self._draft_source = self.draft_text.get("1.0", "end-1c")
+        self._draft_set_source(self.draft_text.get("1.0", "end-1c"))
         saved = getattr(self, "_draft_view_mode_before_search", None)
         if saved is None and hasattr(self, "_draft_view_mode_var"):
             saved = self._draft_view_mode_var.get()
@@ -1394,7 +1421,7 @@ class DailyTaskAssistant:
                     self.draft_text.insert(tk.INSERT, repl)
             self._draft_find_next(backward=False)
             self._draft_highlight_all_matches()
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._draft_set_source(self.draft_text.get("1.0", "end-1c"))
             self._update_draft_stats()
             self._schedule_draft_save()
         except tk.TclError:
@@ -1413,7 +1440,7 @@ class DailyTaskAssistant:
                 self.draft_text.delete("1.0", tk.END)
                 self.draft_text.insert("1.0", new_content)
             self._draft_highlight_all_matches()
-            self._draft_source = self.draft_text.get("1.0", "end-1c")
+            self._draft_set_source(self.draft_text.get("1.0", "end-1c"))
             self._update_draft_stats()
             self._schedule_draft_save()
         except tk.TclError:
