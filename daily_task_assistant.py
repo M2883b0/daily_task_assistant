@@ -11,6 +11,13 @@ import ctypes.wintypes as wintypes
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from draft_tools import (
+    base64_decode_text,
+    base64_encode_text,
+    format_json_text,
+    url_decode_text,
+    url_encode_text,
+)
 
 
 DATE_FMT = "%Y-%m-%d"
@@ -22,6 +29,28 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 GLOBAL_HOTKEY_ID = 1
+ERROR_ALREADY_EXISTS = 183
+SINGLE_INSTANCE_MUTEX_NAME = "DailyTaskAssistant.Singleton.Mutex"
+_single_instance_mutex_handle = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    global _single_instance_mutex_handle
+    if _single_instance_mutex_handle is not None:
+        return True
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            return True
+        last_error = ctypes.windll.kernel32.GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+        _single_instance_mutex_handle = handle
+        return True
+    except Exception:
+        # 异常时不阻止启动，避免误伤正常使用
+        return True
 
 APP_THEME = {
     "bg_root": "#1e222c",
@@ -126,8 +155,15 @@ class DailyTaskAssistant:
         self._draft_return_press_col: int | None = None
         self._draft_markdown_return_handled: bool = False
         self._draft_markdown_delete_handled: bool = False
+        self._task_scroll_host: tk.Misc | None = None
+        self._task_scroll_canvas: tk.Canvas | None = None
+        self._settings_scroll_host: tk.Misc | None = None
+        self._settings_scroll_canvas: tk.Canvas | None = None
+        self._logs_scroll_host: tk.Misc | None = None
+        self._logs_scroll_widget: tk.Text | None = None
 
         self._build_ui()
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel_for_panels, add="+")
         self._load_tasks_for_today()
         self._refresh_task_list()
         self._schedule_incremental_flush()
@@ -196,13 +232,15 @@ class DailyTaskAssistant:
 
         draft_toolbar = ttk.Frame(self.draft_tab, style="Main.TFrame")
         draft_toolbar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(draft_toolbar, text="工具", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(
+        self._draft_tools_popup: tk.Widget | None = None
+        self._draft_tools_menu_button = ttk.Button(
             draft_toolbar,
-            text="JSON 格式化",
-            command=self._draft_format_json,
+            text="工具 ▼",
+            command=self._toggle_draft_tools_popup,
             style="Secondary.TButton",
-        ).pack(side=tk.LEFT)
+        )
+        self._draft_tools_menu_button.pack(side=tk.LEFT)
+        self.root.bind("<Button-1>", self._on_root_click_maybe_hide_draft_tools, add="+")
         ttk.Label(draft_toolbar, text="显示", style="Status.TLabel").pack(side=tk.LEFT, padx=(16, 4))
         self._draft_view_mode_var = tk.StringVar(value="markdown")
         self._draft_md_mode_radio = ttk.Radiobutton(
@@ -285,50 +323,59 @@ class DailyTaskAssistant:
 
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._task_scroll_host = list_container
+        self._task_scroll_canvas = self.canvas
 
         log_toolbar = ttk.Frame(self.logs_tab, style="Main.TFrame")
         log_toolbar.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(log_toolbar, text="视图", style="Status.TLabel").pack(side=tk.LEFT)
         self.log_mode_var = tk.StringVar(value="单日")
-        self.log_mode_combo = ttk.Combobox(
+        self._log_mode_values = ["单日", "周汇总"]
+        self.log_mode_dropdown_btn = ttk.Button(
             log_toolbar,
-            textvariable=self.log_mode_var,
-            values=("单日", "周汇总"),
-            state="readonly",
-            width=8,
-            style="App.TCombobox",
+            text=self.log_mode_var.get() + " ▼",
+            style="Secondary.TButton",
+            command=lambda: self._toggle_log_dropdown("mode"),
         )
-        self.log_mode_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.log_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_log_mode_changed())
+        self.log_mode_dropdown_btn.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Frame(log_toolbar, style="Main.TFrame").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            log_toolbar,
+            text="一键复制周报提示词",
+            command=self._copy_weekly_ai_prompt,
+            style="Secondary.TButton",
+        ).pack(side=tk.RIGHT)
 
         self.log_date_frame = ttk.Frame(log_toolbar, style="Main.TFrame")
         ttk.Label(self.log_date_frame, text="日期", style="Status.TLabel").pack(side=tk.LEFT)
         self.log_day_var = tk.StringVar(value=self.today)
-        self.log_day_combo = ttk.Combobox(
+        self._log_day_values: list[str] = [self.today]
+        self.log_day_dropdown_btn = ttk.Button(
             self.log_date_frame,
-            textvariable=self.log_day_var,
-            state="readonly",
-            width=14,
-            style="App.TCombobox",
+            text=self.log_day_var.get() + " ▼",
+            style="Secondary.TButton",
+            command=lambda: self._toggle_log_dropdown("day"),
         )
-        self.log_day_combo.pack(side=tk.LEFT, padx=(6, 0))
-        self.log_day_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_logs_tab_data())
+        self.log_day_dropdown_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         self.log_week_frame = ttk.Frame(log_toolbar, style="Main.TFrame")
         ttk.Label(self.log_week_frame, text="自然周", style="Status.TLabel").pack(side=tk.LEFT)
         self.log_week_var = tk.StringVar()
-        self.log_week_combo = ttk.Combobox(
+        self._log_week_values: list[str] = []
+        self.log_week_dropdown_btn = ttk.Button(
             self.log_week_frame,
-            textvariable=self.log_week_var,
-            state="readonly",
-            width=32,
-            style="App.TCombobox",
+            text="请选择自然周 ▼",
+            style="Secondary.TButton",
+            command=lambda: self._toggle_log_dropdown("week"),
         )
-        self.log_week_combo.pack(side=tk.LEFT, padx=(6, 0))
-        self.log_week_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_week_view())
+        self.log_week_dropdown_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._active_log_dropdown_popup: tk.Widget | None = None
+        self._active_log_dropdown_kind: str | None = None
 
+        log_text_wrap = ttk.Frame(self.logs_tab, style="Main.TFrame")
+        log_text_wrap.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(
-            self.logs_tab,
+            log_text_wrap,
             bg=th["bg_elevated"],
             fg=th["fg"],
             insertbackground=th["fg"],
@@ -342,45 +389,13 @@ class DailyTaskAssistant:
             pady=10,
             wrap="word",
         )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text_scrollbar = ttk.Scrollbar(log_text_wrap, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=self.log_text_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.configure(state=tk.DISABLED)
-
-        self.weekly_prompt_frame = ttk.Frame(self.logs_tab, style="Main.TFrame")
-        ttk.Label(
-            self.weekly_prompt_frame,
-            text="周报：周汇总模式下预览完整提示词，点「一键复制提示词」粘贴给 AI。",
-            style="Status.TLabel",
-        ).pack(anchor=tk.W, pady=(0, 4))
-        self.weekly_prompt_preview = tk.Text(
-            self.weekly_prompt_frame,
-            height=6,
-            bg=th["bg_elevated"],
-            fg=th["fg_muted"],
-            insertbackground=th["fg"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=th["border"],
-            bd=0,
-            font=UI_FONT_SM,
-            padx=8,
-            pady=6,
-            wrap="word",
-        )
-        self.weekly_prompt_preview.pack(fill=tk.X, pady=(0, 6))
-        self.weekly_prompt_preview.configure(state=tk.DISABLED)
-        prompt_btn_row = ttk.Frame(self.weekly_prompt_frame, style="Main.TFrame")
-        prompt_btn_row.pack(anchor=tk.W, fill=tk.X)
-        ttk.Button(
-            prompt_btn_row,
-            text="一键复制提示词",
-            command=self._copy_weekly_ai_prompt,
-            style="Secondary.TButton",
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            prompt_btn_row,
-            text="（模板可在「设置」中修改）",
-            style="Status.TLabel",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        self._logs_scroll_host = log_text_wrap
+        self._logs_scroll_widget = self.log_text
 
         self._apply_log_mode_layout()
         self._reload_log_comboboxes()
@@ -399,10 +414,65 @@ class DailyTaskAssistant:
         inner_w = max(1, int(event.width))
         self.canvas.itemconfigure(self._canvas_inner_window, width=inner_w)
 
-    def _build_settings_tab(self, frame: ttk.Frame) -> None:
-        inner = ttk.Frame(frame, padding=8, style="Main.TFrame")
-        inner.pack(fill=tk.BOTH, expand=True)
+    def _on_global_mousewheel_for_panels(self, event=None) -> str | None:
+        if event is None:
+            return None
+        try:
+            cursor_widget = self.root.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        except tk.TclError:
+            return None
+        if cursor_widget is None:
+            return None
+        canvas: tk.Canvas | None = None
+        if self._task_scroll_host is not None and self._widget_is_descendant_of(cursor_widget, self._task_scroll_host):
+            canvas = self._task_scroll_canvas
+        elif self._settings_scroll_host is not None and self._widget_is_descendant_of(cursor_widget, self._settings_scroll_host):
+            canvas = self._settings_scroll_canvas
+        elif self._logs_scroll_host is not None and self._widget_is_descendant_of(cursor_widget, self._logs_scroll_host):
+            if self._logs_scroll_widget is not None:
+                try:
+                    delta = int(event.delta / 120)
+                except Exception:
+                    delta = 0
+                if delta == 0:
+                    return None
+                self._logs_scroll_widget.yview_scroll(-delta, "units")
+                return "break"
+        if canvas is None:
+            return None
+        try:
+            delta = int(event.delta / 120)
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return None
+        canvas.yview_scroll(-delta, "units")
+        return "break"
 
+    def _build_settings_tab(self, frame: ttk.Frame) -> None:
+        wrap = ttk.Frame(frame, style="Main.TFrame")
+        wrap.pack(fill=tk.BOTH, expand=True)
+        settings_canvas = tk.Canvas(wrap, bg=APP_THEME["bg_main"], highlightthickness=0, bd=0)
+        settings_scrollbar = ttk.Scrollbar(wrap, orient="vertical", command=settings_canvas.yview)
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        settings_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        inner = ttk.Frame(settings_canvas, padding=8, style="Main.TFrame")
+        settings_canvas_window = settings_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_settings_inner_configure(_event=None):
+            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+
+        def _on_settings_canvas_configure(event):
+            settings_canvas.itemconfigure(settings_canvas_window, width=max(1, int(event.width)))
+
+        inner.bind("<Configure>", _on_settings_inner_configure)
+        settings_canvas.bind("<Configure>", _on_settings_canvas_configure)
+        self._settings_scroll_host = wrap
+        self._settings_scroll_canvas = settings_canvas
+
+        ttk.Label(inner, text="基础快捷键", style="Status.TLabel").pack(anchor=tk.W, pady=(0, 6))
         ttk.Label(inner, text="显示/隐藏全局快捷键（例：CTRL+ALT+T）", style="Status.TLabel").pack(anchor=tk.W)
         self.global_hotkey_entry = ttk.Entry(inner)
         self.global_hotkey_entry.pack(fill=tk.X, pady=(4, 10))
@@ -418,15 +488,31 @@ class DailyTaskAssistant:
         self.tab_key_entry.pack(fill=tk.X, pady=(4, 8))
         self.tab_key_entry.insert(0, self.settings.get("tab_switch_hotkey", "CTRL+TAB"))
 
-        self._bind_auto_save_for_settings_entry(
-            self.global_hotkey_entry, self.focus_key_entry, self.tab_key_entry, mode="global"
-        )
-        self._bind_auto_save_for_settings_entry(
-            self.focus_key_entry, self.global_hotkey_entry, self.tab_key_entry, mode="focus"
-        )
-        self._bind_auto_save_for_settings_entry(
-            self.tab_key_entry, self.global_hotkey_entry, self.focus_key_entry, mode="tab"
-        )
+        ttk.Label(inner, text="工具快捷键", style="Status.TLabel").pack(anchor=tk.W, pady=(10, 6))
+        ttk.Label(inner, text="草稿工具：JSON 格式化（例：CTRL+ALT+J）", style="Status.TLabel").pack(anchor=tk.W)
+        self.tool_json_hotkey_entry = ttk.Entry(inner)
+        self.tool_json_hotkey_entry.pack(fill=tk.X, pady=(4, 8))
+        self.tool_json_hotkey_entry.insert(0, self.settings.get("tool_json_hotkey", "CTRL+ALT+J"))
+
+        ttk.Label(inner, text="草稿工具：Base64 编码（例：CTRL+ALT+E）", style="Status.TLabel").pack(anchor=tk.W)
+        self.tool_b64_encode_hotkey_entry = ttk.Entry(inner)
+        self.tool_b64_encode_hotkey_entry.pack(fill=tk.X, pady=(4, 8))
+        self.tool_b64_encode_hotkey_entry.insert(0, self.settings.get("tool_b64_encode_hotkey", "CTRL+ALT+E"))
+
+        ttk.Label(inner, text="草稿工具：Base64 解码（例：CTRL+ALT+D）", style="Status.TLabel").pack(anchor=tk.W)
+        self.tool_b64_decode_hotkey_entry = ttk.Entry(inner)
+        self.tool_b64_decode_hotkey_entry.pack(fill=tk.X, pady=(4, 8))
+        self.tool_b64_decode_hotkey_entry.insert(0, self.settings.get("tool_b64_decode_hotkey", "CTRL+ALT+D"))
+
+        ttk.Label(inner, text="草稿工具：URL 编码（例：CTRL+ALT+U）", style="Status.TLabel").pack(anchor=tk.W)
+        self.tool_url_encode_hotkey_entry = ttk.Entry(inner)
+        self.tool_url_encode_hotkey_entry.pack(fill=tk.X, pady=(4, 8))
+        self.tool_url_encode_hotkey_entry.insert(0, self.settings.get("tool_url_encode_hotkey", "CTRL+ALT+U"))
+
+        ttk.Label(inner, text="草稿工具：URL 解码（例：CTRL+ALT+I）", style="Status.TLabel").pack(anchor=tk.W)
+        self.tool_url_decode_hotkey_entry = ttk.Entry(inner)
+        self.tool_url_decode_hotkey_entry.pack(fill=tk.X, pady=(4, 8))
+        self.tool_url_decode_hotkey_entry.insert(0, self.settings.get("tool_url_decode_hotkey", "CTRL+ALT+I"))
 
         self.global_hotkey_entry.bind(
             "<FocusIn>",
@@ -440,6 +526,39 @@ class DailyTaskAssistant:
             "<FocusIn>",
             lambda _e: self._record_hotkey_into_entry(self.tab_key_entry, "tab"),
         )
+        self.tool_json_hotkey_entry.bind(
+            "<FocusIn>",
+            lambda _e: self._record_hotkey_into_entry(self.tool_json_hotkey_entry, "combo"),
+        )
+        self.tool_b64_encode_hotkey_entry.bind(
+            "<FocusIn>",
+            lambda _e: self._record_hotkey_into_entry(self.tool_b64_encode_hotkey_entry, "combo"),
+        )
+        self.tool_b64_decode_hotkey_entry.bind(
+            "<FocusIn>",
+            lambda _e: self._record_hotkey_into_entry(self.tool_b64_decode_hotkey_entry, "combo"),
+        )
+        self.tool_url_encode_hotkey_entry.bind(
+            "<FocusIn>",
+            lambda _e: self._record_hotkey_into_entry(self.tool_url_encode_hotkey_entry, "combo"),
+        )
+        self.tool_url_decode_hotkey_entry.bind(
+            "<FocusIn>",
+            lambda _e: self._record_hotkey_into_entry(self.tool_url_decode_hotkey_entry, "combo"),
+        )
+
+        for entry in (
+            self.global_hotkey_entry,
+            self.focus_key_entry,
+            self.tab_key_entry,
+            self.tool_json_hotkey_entry,
+            self.tool_b64_encode_hotkey_entry,
+            self.tool_b64_decode_hotkey_entry,
+            self.tool_url_encode_hotkey_entry,
+            self.tool_url_decode_hotkey_entry,
+        ):
+            entry.bind("<Return>", lambda _e: self._save_shortcut_settings_from_entries())
+            entry.bind("<FocusOut>", lambda _e: self._save_shortcut_settings_from_entries())
 
         ttk.Label(inner, text="窗口透明度（实时生效）", style="Status.TLabel").pack(anchor=tk.W, pady=(12, 4))
         alpha_row = ttk.Frame(inner, style="Main.TFrame")
@@ -593,38 +712,176 @@ class DailyTaskAssistant:
         self._write_settings_file()
 
     def _draft_format_json(self) -> None:
+        selected = self._get_draft_selected_text()
+        if selected is None:
+            return
+        formatted = format_json_text(selected)
+        if formatted is None:
+            return
+        self._draft_apply_transformed_text(formatted, "草稿 JSON 已格式化")
+
+    def _draft_base64_encode(self) -> None:
+        selected = self._get_draft_selected_text()
+        if selected is None:
+            return
+        encoded = base64_encode_text(selected)
+        if encoded is None:
+            return
+        self._draft_apply_transformed_text(encoded, "草稿内容已 Base64 编码")
+
+    def _draft_base64_decode(self) -> None:
+        selected = self._get_draft_selected_text()
+        if selected is None:
+            return
+        decoded = base64_decode_text(selected)
+        if decoded is None:
+            self._record_status("Base64 解码失败：请检查内容是否为 UTF-8 Base64")
+            return
+        self._draft_apply_transformed_text(decoded, "草稿内容已 Base64 解码")
+
+    def _draft_url_encode(self) -> None:
+        selected = self._get_draft_selected_text()
+        if selected is None:
+            return
+        encoded = url_encode_text(selected)
+        if encoded is None:
+            return
+        self._draft_apply_transformed_text(encoded, "草稿内容已 URL 编码")
+
+    def _draft_url_decode(self) -> None:
+        selected = self._get_draft_selected_text()
+        if selected is None:
+            return
+        decoded = url_decode_text(selected)
+        if decoded is None:
+            self._record_status("URL 解码失败：请检查输入内容")
+            return
+        self._draft_apply_transformed_text(decoded, "草稿内容已 URL 解码")
+
+    def _draft_apply_transformed_text(self, transformed: str, success_status: str) -> None:
+        try:
+            start = self.draft_text.index("sel.first")
+            end = self.draft_text.index("sel.last")
+        except tk.TclError:
+            self._record_status("请先选中要处理的文本")
+            return
         try:
             cur_ln = int(self.draft_text.index("insert").split(".")[0])
         except tk.TclError:
             cur_ln = 1
         self._draft_sync_line_at(cur_ln)
-        raw = self._draft_source.strip()
-        if not raw:
-            return
+        self.draft_text.delete(start, end)
+        self.draft_text.insert(start, transformed)
+        new_insert = f"{start}+{len(transformed)}c"
+        self.draft_text.mark_set("insert", new_insert)
+        self.draft_text.see("insert")
+        self._draft_set_source(self.draft_text.get("1.0", "end-1c"), coalesce=False)
         try:
-            obj = json.loads(raw)
-            for _ in range(2):
-                if not isinstance(obj, str):
-                    break
-                s = obj.strip()
-                if not s:
-                    break
-                try:
-                    obj2 = json.loads(s)
-                except json.JSONDecodeError:
-                    break
-                obj = obj2
-            formatted = json.dumps(obj, ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            return
-        self._draft_set_source(formatted, coalesce=False)
-        self._draft_force_raw = True
-        if hasattr(self, "_draft_view_mode_var"):
-            self._draft_view_mode_var.set("source")
-        self._draft_refresh_view()
+            insert_line = int(self.draft_text.index("insert").split(".")[0])
+        except tk.TclError:
+            insert_line = 1
+        self._draft_refresh_view(focus_line=insert_line, focus_col=0)
         self._save_draft_text()
         self._update_draft_stats()
-        self._record_status("草稿 JSON 已格式化")
+        self._record_status(success_status)
+
+    def _get_draft_selected_text(self) -> str | None:
+        try:
+            selected = self.draft_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            self._record_status("未选中文本：工具不会执行")
+            return None
+        if not selected:
+            self._record_status("未选中文本：工具不会执行")
+            return None
+        return selected
+
+    def _toggle_draft_tools_popup(self) -> None:
+        if self._draft_tools_popup is not None and self._draft_tools_popup.winfo_exists():
+            self._hide_draft_tools_popup()
+            return
+        self._show_draft_tools_popup()
+
+    def _show_draft_tools_popup(self) -> None:
+        popup = ttk.Frame(self.root, style="Main.TFrame", padding=4)
+        popup.configure(borderwidth=1, relief="solid")
+        self._draft_tools_popup = popup
+        inner = ttk.Frame(popup, style="Main.TFrame")
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Button(inner, text="JSON 格式化", style="Secondary.TButton", command=lambda: self._run_tool_and_close(self._draft_format_json)).pack(fill=tk.X, pady=1)
+        ttk.Button(inner, text="Base64 编码", style="Secondary.TButton", command=lambda: self._run_tool_and_close(self._draft_base64_encode)).pack(fill=tk.X, pady=1)
+        ttk.Button(inner, text="Base64 解码", style="Secondary.TButton", command=lambda: self._run_tool_and_close(self._draft_base64_decode)).pack(fill=tk.X, pady=1)
+        ttk.Button(inner, text="URL 编码", style="Secondary.TButton", command=lambda: self._run_tool_and_close(self._draft_url_encode)).pack(fill=tk.X, pady=1)
+        ttk.Button(inner, text="URL 解码", style="Secondary.TButton", command=lambda: self._run_tool_and_close(self._draft_url_decode)).pack(fill=tk.X, pady=1)
+
+        popup.update_idletasks()
+        bx = self._draft_tools_menu_button.winfo_rootx() - self.root.winfo_rootx()
+        by = self._draft_tools_menu_button.winfo_rooty() - self.root.winfo_rooty() + self._draft_tools_menu_button.winfo_height() + 2
+        popup.place(x=bx, y=by)
+        popup.lift()
+
+    def _run_tool_and_close(self, callback) -> None:
+        self._hide_draft_tools_popup()
+        callback()
+
+    def _hide_draft_tools_popup(self) -> None:
+        if self._draft_tools_popup is None:
+            return
+        try:
+            if self._draft_tools_popup.winfo_exists():
+                self._draft_tools_popup.destroy()
+        except tk.TclError:
+            pass
+        self._draft_tools_popup = None
+
+    def _on_root_click_maybe_hide_draft_tools(self, event=None) -> None:
+        if self._draft_tools_popup is None or not self._draft_tools_popup.winfo_exists():
+            self._on_root_click_maybe_hide_log_dropdown(event)
+            return
+        widget = event.widget if event is not None else None
+        if widget is None:
+            self._hide_draft_tools_popup()
+            self._on_root_click_maybe_hide_log_dropdown(event)
+            return
+        if widget == self._draft_tools_menu_button or self._widget_is_descendant_of(widget, self._draft_tools_menu_button):
+            self._on_root_click_maybe_hide_log_dropdown(event)
+            return
+        if self._widget_is_descendant_of(widget, self._draft_tools_popup):
+            self._on_root_click_maybe_hide_log_dropdown(event)
+            return
+        self._hide_draft_tools_popup()
+        self._on_root_click_maybe_hide_log_dropdown(event)
+
+    def _on_root_click_maybe_hide_log_dropdown(self, event=None) -> None:
+        if self._active_log_dropdown_popup is None or not self._active_log_dropdown_popup.winfo_exists():
+            return
+        widget = event.widget if event is not None else None
+        if widget is None:
+            self._hide_log_dropdown()
+            return
+        if widget in (self.log_mode_dropdown_btn, self.log_day_dropdown_btn, self.log_week_dropdown_btn):
+            return
+        if self._widget_is_descendant_of(widget, self._active_log_dropdown_popup):
+            return
+        self._hide_log_dropdown()
+
+    def _widget_is_descendant_of(self, widget, ancestor) -> bool:
+        cur = widget
+        while cur is not None:
+            if cur == ancestor:
+                return True
+            try:
+                parent_name = cur.winfo_parent()
+            except tk.TclError:
+                return False
+            if not parent_name:
+                return False
+            try:
+                cur = cur.nametowidget(parent_name)
+            except Exception:
+                return False
+        return False
 
     def _apply_draft_view_mode_from_toolbar(self) -> None:
         """工具栏「Markdown / 源码」切换，对应 Typora 的视图切换。"""
@@ -672,8 +929,18 @@ class DailyTaskAssistant:
         w.tag_configure("md_quote", foreground=APP_THEME["fg_muted"], lmargin1=12, lmargin2=12)
         w.tag_configure("md_list", lmargin1=10, lmargin2=22)
         w.tag_configure("md_code_inline", background=APP_THEME["bg_elevated"], font=MONO_FONT)
-        w.tag_configure("md_code_block", background=APP_THEME["bg_elevated"], font=MONO_FONT, lmargin1=10, lmargin2=10)
+        w.tag_configure("md_code_block", background=APP_THEME["bg_elevated"], font=MONO_FONT, lmargin1=0, lmargin2=0)
         w.tag_configure("md_code_fence", foreground=APP_THEME["fg_muted"], font=MONO_FONT)
+        w.tag_configure("md_code_lineno", foreground=APP_THEME["fg_muted"], font=MONO_FONT, lmargin1=0, lmargin2=0)
+        w.tag_configure("md_code_kw", foreground="#82b0ff", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_code_str", foreground="#9adf9f", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_code_comment", foreground="#7f8ba3", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_code_box", background="#232936", lmargin1=0, lmargin2=0, spacing1=2, spacing3=2)
+        w.tag_configure("md_math_cmd", foreground="#82b0ff", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_math_num", foreground="#ffd580", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_math_op", foreground="#ff9aa2", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_math_brace", foreground="#caa6ff", background=APP_THEME["bg_elevated"], font=MONO_FONT)
+        w.tag_configure("md_math_block", background=APP_THEME["bg_elevated"], foreground=APP_THEME["accent"], font=MONO_FONT, lmargin1=10, lmargin2=10)
         w.tag_configure("md_bold", font=("Microsoft YaHei UI", 10, "bold"))
         w.tag_configure("md_italic", font=("Microsoft YaHei UI", 10, "italic"))
         w.tag_configure("md_strike", overstrike=1)
@@ -681,7 +948,7 @@ class DailyTaskAssistant:
         w.tag_configure("md_hr", foreground=APP_THEME["fg_muted"])
 
     def _insert_markdown_inline(self, widget: tk.Text, text: str, base_tags: tuple[str, ...] = ()) -> None:
-        token_re = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|~~[^~]+~~|\[[^\]]+\]\([^)]+\))")
+        token_re = re.compile(r"(`[^`]+`|\$\$[^$]+\$\$|\$[^$\n]+\$|\*\*[^*]+\*\*|\*[^*]+\*|~~[^~]+~~|\[[^\]]+\]\([^)]+\))")
         pos = 0
         for m in token_re.finditer(text):
             if m.start() > pos:
@@ -692,6 +959,12 @@ class DailyTaskAssistant:
             if token.startswith("`") and token.endswith("`"):
                 out = token[1:-1]
                 tags.append("md_code_inline")
+            elif token.startswith("$$") and token.endswith("$$"):
+                out = self._render_latex_to_text(token[2:-2])
+                tags.append("md_math_block")
+            elif token.startswith("$") and token.endswith("$"):
+                out = self._render_latex_to_text(token[1:-1])
+                tags.append("md_math_block")
             elif token.startswith("**") and token.endswith("**"):
                 out = token[2:-2]
                 tags.append("md_bold")
@@ -710,6 +983,89 @@ class DailyTaskAssistant:
             pos = m.end()
         if pos < len(text):
             widget.insert(tk.END, text[pos:], base_tags)
+
+    def _render_latex_to_text(self, expr: str) -> str:
+        s = expr.strip()
+        s = s.replace(r"\\", "\n")
+        s = s.replace("&", "  ")
+
+        # 常见环境 -> 文本布局
+        env_patterns = [
+            r"\\begin\{(?:matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|array)\}",
+            r"\\end\{(?:matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|array)\}",
+            r"\\begin\{(?:align|aligned|cases|gather)\}",
+            r"\\end\{(?:align|aligned|cases|gather)\}",
+        ]
+        for p in env_patterns:
+            s = re.sub(p, "", s)
+
+        # \text{...}
+        s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+        s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
+
+        # 分数/根号（多轮以支持简单嵌套）
+        frac_re = re.compile(r"\\(?:d?frac|tfrac)\{([^{}]+)\}\{([^{}]+)\}")
+        sqrt_re = re.compile(r"\\sqrt(?:\[[^\]]+\])?\{([^{}]+)\}")
+        for _ in range(4):
+            changed = False
+            m = frac_re.search(s)
+            if m:
+                s = s[: m.start()] + f"({m.group(1)})/({m.group(2)})" + s[m.end() :]
+                changed = True
+            m = sqrt_re.search(s)
+            if m:
+                s = s[: m.start()] + f"√({m.group(1)})" + s[m.end() :]
+                changed = True
+            if not changed:
+                break
+
+        # 大型运算符带上下限
+        s = re.sub(r"\\sum_\{([^{}]+)\}\^\{([^{}]+)\}", r"∑(\1→\2)", s)
+        s = re.sub(r"\\prod_\{([^{}]+)\}\^\{([^{}]+)\}", r"∏(\1→\2)", s)
+        s = re.sub(r"\\int_\{([^{}]+)\}\^\{([^{}]+)\}", r"∫[\1,\2]", s)
+        s = re.sub(r"\\lim_\{([^{}]+)\}", r"lim(\1)", s)
+
+        cmd_map = {
+            # Greek
+            r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ", r"\epsilon": "ε", r"\varepsilon": "ε",
+            r"\zeta": "ζ", r"\eta": "η", r"\theta": "θ", r"\vartheta": "ϑ", r"\iota": "ι", r"\kappa": "κ",
+            r"\lambda": "λ", r"\mu": "μ", r"\nu": "ν", r"\xi": "ξ", r"\pi": "π", r"\varpi": "ϖ",
+            r"\rho": "ρ", r"\varrho": "ϱ", r"\sigma": "σ", r"\varsigma": "ς", r"\tau": "τ", r"\upsilon": "υ",
+            r"\phi": "φ", r"\varphi": "ϕ", r"\chi": "χ", r"\psi": "ψ", r"\omega": "ω",
+            r"\Gamma": "Γ", r"\Delta": "Δ", r"\Theta": "Θ", r"\Lambda": "Λ", r"\Xi": "Ξ", r"\Pi": "Π",
+            r"\Sigma": "Σ", r"\Upsilon": "Υ", r"\Phi": "Φ", r"\Psi": "Ψ", r"\Omega": "Ω",
+            # Ops/relations
+            r"\times": "×", r"\cdot": "·", r"\div": "÷", r"\pm": "±", r"\mp": "∓",
+            r"\leq": "≤", r"\geq": "≥", r"\neq": "≠", r"\approx": "≈", r"\equiv": "≡",
+            r"\to": "→", r"\rightarrow": "→", r"\leftarrow": "←", r"\leftrightarrow": "↔",
+            r"\Rightarrow": "⇒", r"\Leftarrow": "⇐", r"\Leftrightarrow": "⇔",
+            r"\infty": "∞", r"\partial": "∂", r"\nabla": "∇", r"\forall": "∀", r"\exists": "∃",
+            r"\in": "∈", r"\notin": "∉", r"\subset": "⊂", r"\subseteq": "⊆", r"\supset": "⊃", r"\supseteq": "⊇",
+            r"\cup": "∪", r"\cap": "∩", r"\emptyset": "∅",
+            r"\land": "∧", r"\lor": "∨", r"\neg": "¬",
+            r"\sin": "sin", r"\cos": "cos", r"\tan": "tan", r"\cot": "cot", r"\sec": "sec", r"\csc": "csc",
+            r"\ln": "ln", r"\log": "log", r"\exp": "exp",
+            r"\sum": "∑", r"\prod": "∏", r"\int": "∫", r"\oint": "∮",
+            r"\cdots": "⋯", r"\ldots": "…", r"\vdots": "⋮", r"\ddots": "⋱",
+            r"\quad": "  ", r"\qquad": "    ", r"\,": " ", r"\;": " ", r"\:": " ",
+        }
+        for k, v in cmd_map.items():
+            s = s.replace(k, v)
+
+        # 上下标
+        s = re.sub(r"\^\{([^{}]+)\}", r"^(\1)", s)
+        s = re.sub(r"_\{([^{}]+)\}", r"_(\1)", s)
+        s = re.sub(r"\^([A-Za-z0-9+\-])", r"^\1", s)
+        s = re.sub(r"_([A-Za-z0-9+\-])", r"_\1", s)
+
+        # 清理包裹命令和分隔符
+        s = s.replace(r"\left", "").replace(r"\right", "")
+        s = s.replace(r"\!", "").replace(r"\,", " ")
+        s = s.replace("{", "(").replace("}", ")")
+        s = re.sub(r"\\[A-Za-z]+", "", s)  # 移除残留未识别命令
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s.strip()
 
     def _draft_append_rendered_markdown_line(self, w: tk.Text, line: str) -> None:
         h = re.match(r"^(#{1,6})\s+(.*)$", line)
@@ -737,6 +1093,138 @@ class DailyTaskAssistant:
             return
         self._insert_markdown_inline(w, line)
 
+    def _draft_insert_code_line_with_highlight(self, line: str, line_no: int, digits_max: int) -> None:
+        # 代码块行号占位宽度固定：digits_max（数字位） + 1（末尾空格），避免多位数时“看起来缩进不齐”
+        prefix = f"{line_no:>{digits_max}} "
+        self.draft_text.insert("end", prefix, ("md_code_box", "md_code_lineno"))
+        text = line if line else " "
+        # 注释
+        cmt_idx = None
+        for token in ("#", "//"):
+            i = text.find(token)
+            if i != -1 and (cmt_idx is None or i < cmt_idx):
+                cmt_idx = i
+        code_part = text if cmt_idx is None else text[:cmt_idx]
+        cmt_part = "" if cmt_idx is None else text[cmt_idx:]
+
+        token_re = re.compile(r"(\"[^\"]*\"|'[^']*'|\b(?:def|class|return|if|elif|else|for|while|try|except|import|from|as|with|async|await|function|const|let|var|public|private|protected|static|new)\b)")
+        pos = 0
+        for m in token_re.finditer(code_part):
+            if m.start() > pos:
+                self.draft_text.insert("end", code_part[pos : m.start()], ("md_code_box", "md_code_block"))
+            token = m.group(0)
+            if (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'")):
+                self.draft_text.insert("end", token, ("md_code_box", "md_code_str"))
+            else:
+                self.draft_text.insert("end", token, ("md_code_box", "md_code_kw"))
+            pos = m.end()
+        if pos < len(code_part):
+            self.draft_text.insert("end", code_part[pos:], ("md_code_box", "md_code_block"))
+        if cmt_part:
+            self.draft_text.insert("end", cmt_part, ("md_code_box", "md_code_comment"))
+        self.draft_text.insert("end", "\n", ("md_code_box", "md_code_block"))
+
+    def _draft_insert_math_line_with_highlight(self, line: str) -> None:
+        text = line if line else " "
+        token_re = re.compile(r"(\\[A-Za-z]+|\\.|[0-9]+(?:\.[0-9]+)?|[\+\-\*/=\^_]|[\(\)\[\]\{\}]|.)")
+        for m in token_re.finditer(text):
+            token = m.group(0)
+            if token.startswith("\\"):
+                tags = ("md_math_block", "md_math_cmd")
+            elif re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
+                tags = ("md_math_block", "md_math_num")
+            elif token in "+-*/=^_":
+                tags = ("md_math_block", "md_math_op")
+            elif token in "()[]{}":
+                tags = ("md_math_block", "md_math_brace")
+            else:
+                tags = ("md_math_block",)
+            self.draft_text.insert("end", token, tags)
+        self.draft_text.insert("end", "\n", ("md_math_block",))
+
+    def _draft_get_code_block_bounds(self, lines: list[str], focus_line_1based: int) -> tuple[int, int] | None:
+        for start, end in self._draft_collect_closed_code_ranges(lines):
+            if start <= focus_line_1based <= end:
+                return start, end
+        return None
+
+    def _draft_collect_closed_code_ranges(self, lines: list[str]) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start: int | None = None
+        for i, line in enumerate(lines, start=1):
+            if not line.strip().startswith("```"):
+                continue
+            if start is None:
+                start = i
+            else:
+                ranges.append((start, i))
+                start = None
+        return ranges
+
+    def _draft_collect_closed_math_ranges(self, lines: list[str]) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start: int | None = None
+        for i, line in enumerate(lines, start=1):
+            if line.strip() != "$$":
+                continue
+            if start is None:
+                start = i
+            else:
+                ranges.append((start, i))
+                start = None
+        return ranges
+
+    def _draft_is_inside_code_block_before_line(self, lines: list[str], line_1based: int) -> bool:
+        in_code = False
+        for i, line in enumerate(lines, start=1):
+            if i >= line_1based:
+                break
+            if line.strip().startswith("```"):
+                in_code = not in_code
+        return in_code
+
+    def _draft_is_inside_math_block_before_line(self, lines: list[str], line_1based: int) -> bool:
+        in_math = False
+        for i, line in enumerate(lines, start=1):
+            if i >= line_1based:
+                break
+            if line.strip() == "$$":
+                in_math = not in_math
+        return in_math
+
+    def _draft_find_closed_code_block_range_by_line(self, parts: list[str], line_1based: int) -> tuple[int, int] | None:
+        for s, e in self._draft_collect_closed_code_ranges(parts):
+            # 只对代码块内部内容行（不含起止围栏）做补全
+            if s < line_1based < e:
+                return s, e
+        return None
+
+    def _draft_set_insert_in_codeblock_by_source_offset(self, src_offset: int) -> None:
+        try:
+            src_ln, src_col = self._draft_source_line_col_from_offset(src_offset)
+        except Exception:
+            return
+        parts = self._draft_source.split("\n")
+        rng = self._draft_find_closed_code_block_range_by_line(parts, src_ln)
+        if rng is None:
+            try:
+                self.draft_text.mark_set("insert", f"{src_ln}.{max(0, src_col)}")
+                self.draft_text.see("insert")
+            except tk.TclError:
+                pass
+            return
+        s, e = rng
+        # 固定行号占位宽度：digits_max（内容最大行号位数）+ 1（末尾空格）
+        content_count = max(1, e - s - 1)
+        digits_max = len(str(content_count))
+        prefix_len = digits_max + 1
+        view_col = prefix_len + max(0, src_col)
+        try:
+            self.draft_text.mark_set("insert", f"{src_ln}.{view_col}")
+            self.draft_text.see("insert")
+        except tk.TclError:
+            pass
+
     def _draft_sync_line_at(self, line_1based: int) -> None:
         if self._draft_refreshing:
             return
@@ -755,6 +1243,22 @@ class DailyTaskAssistant:
             raw = self.draft_text.get(f"{line_1based}.0", f"{line_1based}.end")
         except tk.TclError:
             return
+        # 代码块渲染会在每行前面加“行号前缀”，回写源码前必须剥离，否则光标移动会把行号写入源码
+        try:
+            code_rng = self._draft_find_closed_code_block_range_by_line(parts, line_1based)
+        except Exception:
+            code_rng = None
+        if code_rng is not None:
+            # 固定剥离渲染层行号前缀宽度（digits_max + 1 空格），
+            # 避免用户删掉部分数字时正则失效导致缩进/行号污染源码。
+            s, e = code_rng
+            content_count = max(1, e - s - 1)
+            digits_max = len(str(content_count))
+            prefix_len = digits_max + 1
+            if len(raw) >= prefix_len:
+                raw = raw[prefix_len:]
+            else:
+                raw = ""
         parts[line_1based - 1] = raw
         self._draft_set_source("\n".join(parts))
 
@@ -841,6 +1345,20 @@ class DailyTaskAssistant:
             return 0
         ln = max(1, min(int(line_1based), len(parts)))
         src = parts[ln - 1]
+
+        # 闭合代码块内容行：视图列 = 行号前缀长度 + 源码列（避免 difflib 因前缀干扰导致偏移）
+        try:
+            code_rng = self._draft_find_closed_code_block_range_by_line(parts, ln)
+        except Exception:
+            code_rng = None
+        if code_rng is not None:
+            s, e = code_rng
+            content_count = max(1, e - s - 1)
+            digits_max = len(str(content_count))
+            prefix_len = digits_max + 1
+            if s < ln < e:
+                return max(0, min(int(view_col) - prefix_len, len(src)))
+
         try:
             view = self.draft_text.get(f"{ln}.0", f"{ln}.end")
         except tk.TclError:
@@ -885,6 +1403,23 @@ class DailyTaskAssistant:
         src_col = self._draft_line_view_to_source_col(ln, col)
         return self._draft_source_offset_from_line_col(ln, src_col)
 
+    def _draft_view_col_to_source_col_for_focus(self, line_1based: int, view_col: int) -> int:
+        # 对闭合代码块内容行，视图列 = 行号前缀长度 + 源码列，可直接精确换算，
+        # 避免 difflib 在“带行号前缀 + 高亮片段”场景下偏移。
+        parts = self._draft_source.split("\n")
+        if not self._draft_force_raw:
+            rng = self._draft_find_closed_code_block_range_by_line(parts, line_1based)
+            if rng is not None:
+                s, _e = rng
+                e = _e
+                content_count = max(1, e - s - 1)
+                digits_max = len(str(content_count))
+                prefix_len = digits_max + 1
+                src_line = parts[line_1based - 1] if 0 <= line_1based - 1 < len(parts) else ""
+                src_col = view_col - prefix_len
+                return max(0, min(int(src_col), len(src_line)))
+        return self._draft_line_view_to_source_col(line_1based, view_col)
+
     def _draft_refresh_view(self, focus_line: int | None = None, focus_col: int | None = None) -> None:
         if not hasattr(self, "draft_text"):
             return
@@ -917,17 +1452,50 @@ class DailyTaskAssistant:
                 col = max(0, min(col, len(line_text)))
 
             self.draft_text.delete("1.0", "end")
-            in_code = False
-
+            code_line_no = 0
+            code_ranges = self._draft_collect_closed_code_ranges(lines)
+            math_ranges = self._draft_collect_closed_math_ranges(lines)
+            code_digits_max_by_line: dict[int, int] = {}
+            code_range_by_line: dict[int, tuple[int, int]] = {}
+            math_range_by_line: dict[int, tuple[int, int]] = {}
+            for s, e in code_ranges:
+                for ln in range(s, e + 1):
+                    code_range_by_line[ln] = (s, e)
+                # code content lines are (s+1) .. (e-1)
+                content_count = max(0, e - s - 1)
+                digits_max = len(str(max(1, content_count)))
+                for ln in range(s + 1, e):
+                    code_digits_max_by_line[ln] = digits_max
+            for s, e in math_ranges:
+                for ln in range(s, e + 1):
+                    math_range_by_line[ln] = (s, e)
             for i, line in enumerate(lines):
                 lineno = i + 1
                 stripped = line.strip()
                 is_fence = stripped.startswith("```")
+                is_math_fence = stripped == "$$"
+                code_bounds = code_range_by_line.get(lineno)
+                math_bounds = math_range_by_line.get(lineno)
+                in_code = code_bounds is not None
+                in_math = math_bounds is not None
                 show_raw = self._draft_force_raw or (lineno == line_no)
+                # 代码块内容行：无论焦点在哪里，都走“带行号/高亮”的代码渲染，
+                # 避免补全时依赖的视图列->源码列映射失效。
+                if in_code and not self._draft_force_raw:
+                    show_raw = False
+                if in_math and not self._draft_force_raw:
+                    show_raw = False
 
                 if is_fence:
-                    in_code = not in_code
-                    if show_raw:
+                    if in_code:
+                        code_line_no = 0
+                    if show_raw or not in_code:
+                        self.draft_text.insert("end", line + "\n")
+                    else:
+                        self.draft_text.insert("end", line + "\n", ("md_code_fence",))
+                    continue
+                if is_math_fence:
+                    if show_raw or not in_math:
                         self.draft_text.insert("end", line + "\n")
                     else:
                         self.draft_text.insert("end", line + "\n", ("md_code_fence",))
@@ -938,13 +1506,28 @@ class DailyTaskAssistant:
                     continue
 
                 if in_code:
-                    self.draft_text.insert("end", (line if line else " ") + "\n", ("md_code_block",))
+                    code_line_no += 1
+                    digits_max = code_digits_max_by_line.get(lineno, 1)
+                    self._draft_insert_code_line_with_highlight(line, code_line_no, digits_max)
+                    continue
+                if in_math:
+                    rendered = self._render_latex_to_text(line if line else " ")
+                    self._draft_insert_math_line_with_highlight(rendered)
                     continue
 
                 self._draft_append_rendered_markdown_line(self.draft_text, line)
                 self.draft_text.insert("end", "\n")
 
-            self.draft_text.mark_set("insert", f"{line_no}.{col}")
+            view_col = col
+            if not self._draft_force_raw:
+                rng = self._draft_find_closed_code_block_range_by_line(lines, line_no)
+                if rng is not None:
+                    s, _e = rng
+                    content_count = max(1, _e - s - 1)
+                    digits_max = len(str(content_count))
+                    prefix_len = digits_max + 1
+                    view_col = prefix_len + col
+            self.draft_text.mark_set("insert", f"{line_no}.{view_col}")
             self.draft_text.see("insert")
             self._draft_last_nav_line = line_no
             self._draft_active_raw_line = line_no
@@ -1025,7 +1608,8 @@ class DailyTaskAssistant:
         # 行切换只做渲染层切换，源码层不参与（除非上面 modified=True 且已写回 active 行）
         active_line = self._draft_active_raw_line if self._draft_active_raw_line is not None else cur
         if cur != active_line:
-            self._draft_refresh_view(focus_line=cur, focus_col=col)
+            src_col = self._draft_view_col_to_source_col_for_focus(cur, col)
+            self._draft_refresh_view(focus_line=cur, focus_col=src_col)
         else:
             self._draft_last_nav_line = cur
             self._draft_active_raw_line = cur
@@ -1063,6 +1647,160 @@ class DailyTaskAssistant:
         except tk.TclError:
             pass
 
+    def _draft_on_editor_keypress(self, event=None) -> str | None:
+        if self._draft_refreshing or self._draft_force_raw:
+            return None
+        if event is None:
+            return None
+        ch = getattr(event, "char", "") or ""
+        keysym = (getattr(event, "keysym", "") or "").strip()
+
+        # Tab：在代码块内插入 3 个空格
+        if keysym == "Tab" or ch == "\t":
+            try:
+                if self.draft_text.tag_ranges(tk.SEL):
+                    return None
+            except tk.TclError:
+                pass
+            return self._draft_codeblock_insert_spaces(3)
+
+        # 引号补全（代码块内）
+        if ch in ("'", '"'):
+            return self._draft_codeblock_quote_pair(ch)
+
+        # 括号补全（代码块内）
+        if ch != "(":
+            return None
+
+        try:
+            src_offset = self._draft_view_index_to_source_offset(self.draft_text.index("insert"))
+        except Exception:
+            return None
+
+        parts = self._draft_source.split("\n")
+        src_ln, _src_col = self._draft_source_line_col_from_offset(src_offset)
+        rng = self._draft_find_closed_code_block_range_by_line(parts, src_ln)
+        if rng is None:
+            return None
+
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                sel_first = self.draft_text.index(tk.SEL_FIRST)
+                sel_last = self.draft_text.index(tk.SEL_LAST)
+                src_start = self._draft_view_index_to_source_offset(sel_first)
+                src_end = self._draft_view_index_to_source_offset(sel_last)
+                if src_end < src_start:
+                    src_start, src_end = src_end, src_start
+            else:
+                src_start = src_offset
+                src_end = src_offset
+        except Exception:
+            return None
+
+        selected = self._draft_source[src_start:src_end]
+        new_source = self._draft_source[:src_start] + "(" + selected + ")" + self._draft_source[src_end:]
+        self._draft_set_source(new_source, coalesce=False)
+
+        cursor_offset = src_start + 1 + len(selected)
+        cursor_ln, cursor_col = self._draft_source_line_col_from_offset(cursor_offset)
+        self._draft_refresh_view(focus_line=cursor_ln, focus_col=cursor_col)
+        self._draft_set_insert_in_codeblock_by_source_offset(cursor_offset)
+        self._update_draft_stats()
+        self._schedule_draft_save()
+        return "break"
+
+    def _draft_codeblock_insert_spaces(self, n: int) -> str | None:
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                return None
+        except tk.TclError:
+            pass
+        try:
+            src_offset = self._draft_view_index_to_source_offset(self.draft_text.index("insert"))
+        except Exception:
+            return None
+        parts = self._draft_source.split("\n")
+        src_ln, _src_col = self._draft_source_line_col_from_offset(src_offset)
+        rng = self._draft_find_closed_code_block_range_by_line(parts, src_ln)
+        if rng is None:
+            return None
+        new_source = self._draft_source[:src_offset] + (" " * n) + self._draft_source[src_offset:]
+        self._draft_set_source(new_source, coalesce=False)
+        cursor_offset = src_offset + n
+        cursor_ln, cursor_col = self._draft_source_line_col_from_offset(cursor_offset)
+        self._draft_refresh_view(focus_line=cursor_ln, focus_col=cursor_col)
+        self._draft_set_insert_in_codeblock_by_source_offset(cursor_offset)
+        self._update_draft_stats()
+        self._schedule_draft_save()
+        return "break"
+
+    def _draft_codeblock_quote_pair(self, quote_char: str) -> str | None:
+        parts = self._draft_source.split("\n")
+        try:
+            src_offset = self._draft_view_index_to_source_offset(self.draft_text.index("insert"))
+        except Exception:
+            return None
+        src_ln, _src_col = self._draft_source_line_col_from_offset(src_offset)
+        rng = self._draft_find_closed_code_block_range_by_line(parts, src_ln)
+        if rng is None:
+            return None
+
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                sel_first = self.draft_text.index(tk.SEL_FIRST)
+                sel_last = self.draft_text.index(tk.SEL_LAST)
+                src_start = self._draft_view_index_to_source_offset(sel_first)
+                src_end = self._draft_view_index_to_source_offset(sel_last)
+                if src_end < src_start:
+                    src_start, src_end = src_end, src_start
+            else:
+                src_start = src_offset
+                src_end = src_offset
+        except Exception:
+            return None
+
+        selected = self._draft_source[src_start:src_end]
+        new_source = self._draft_source[:src_start] + quote_char + selected + quote_char + self._draft_source[src_end:]
+        self._draft_set_source(new_source, coalesce=False)
+
+        cursor_offset = src_start + 1 + len(selected)
+        cursor_ln, cursor_col = self._draft_source_line_col_from_offset(cursor_offset)
+        self._draft_refresh_view(focus_line=cursor_ln, focus_col=cursor_col)
+        self._draft_set_insert_in_codeblock_by_source_offset(cursor_offset)
+        self._update_draft_stats()
+        self._schedule_draft_save()
+        return "break"
+
+    def _draft_handle_paste(self, _event=None) -> str:
+        try:
+            clip_text = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if clip_text is None:
+            return "break"
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                start_index = self.draft_text.index(tk.SEL_FIRST)
+                end_index = self.draft_text.index(tk.SEL_LAST)
+            else:
+                start_index = self.draft_text.index("insert")
+                end_index = start_index
+        except tk.TclError:
+            return "break"
+
+        src_start = self._draft_view_index_to_source_offset(start_index)
+        src_end = self._draft_view_index_to_source_offset(end_index)
+        if src_end < src_start:
+            src_start, src_end = src_end, src_start
+        new_source = self._draft_source[:src_start] + clip_text + self._draft_source[src_end:]
+        self._draft_set_source(new_source, coalesce=False)
+        new_offset = src_start + len(clip_text)
+        focus_ln, focus_col = self._draft_source_line_col_from_offset(new_offset)
+        self._draft_refresh_view(focus_line=focus_ln, focus_col=focus_col)
+        self._update_draft_stats()
+        self._schedule_draft_save()
+        return "break"
+
     def _draft_handle_return(self, _event=None) -> str | None:
         if self._draft_force_raw:
             self._draft_return_press_col = None
@@ -1084,6 +1822,74 @@ class DailyTaskAssistant:
             self._draft_return_press_col = None
             return None
         line = lines[i]
+
+        code_fence_match = re.match(r"^\s*```(?:\s+[^\s`][^`]*)?\s*$", line)
+        if code_fence_match:
+            # 纯 ``` 且位于现有代码块内时，该行是“闭合围栏”，回车不做自动补全
+            if line.strip() == "```" and self._draft_is_inside_code_block_before_line(lines, ln):
+                return None
+            lines.insert(i + 1, "")
+            lines.insert(i + 2, "```")
+            self._draft_set_source("\n".join(lines), coalesce=False)
+            self._draft_refresh_view(focus_line=ln + 1, focus_col=0)
+            self._draft_markdown_return_handled = True
+            return "break"
+
+        if re.match(r"^\s*\$\$\s*$", line):
+            # 纯 $$ 且位于现有公式块内时，该行是“闭合围栏”，回车不做自动补全
+            if line.strip() == "$$" and self._draft_is_inside_math_block_before_line(lines, ln):
+                return None
+            lines.insert(i + 1, "")
+            lines.insert(i + 2, "$$")
+            self._draft_set_source("\n".join(lines), coalesce=False)
+            self._draft_refresh_view(focus_line=ln + 1, focus_col=0)
+            self._draft_markdown_return_handled = True
+            return "break"
+
+        # 代码块内：缩进与通用补全
+        try:
+            src_offset = self._draft_view_index_to_source_offset(self.draft_text.index("insert"))
+            src_ln, src_col = self._draft_source_line_col_from_offset(src_offset)
+        except Exception:
+            src_ln, src_col = ln, col
+
+        code_range = self._draft_find_closed_code_block_range_by_line(lines, src_ln)
+        if code_range:
+            code_line = lines[src_ln - 1]
+            indent_m = re.match(r"^(\s*)", code_line)
+            base_indent = indent_m.group(1) if indent_m else ""
+            indent_more = base_indent + ("\t" if "\t" in base_indent else "    ")
+            left = code_line[:src_col]
+            right = code_line[src_col:]
+
+            # "{ + Enter" -> 下一行缩进 + 空行，然后补上对应 "}"（保留右侧内容）
+            if left.rstrip().endswith("{"):
+                new_parts = (
+                    lines[: src_ln - 1]
+                    + [left, indent_more, base_indent + "}" + right]
+                    + lines[src_ln:]
+                )
+                self._draft_set_source("\n".join(new_parts), coalesce=False)
+                # 光标放到缩进那一行
+                cursor_offset = self._draft_source_offset_from_line_col(src_ln + 1, len(indent_more))
+                self._draft_refresh_view(focus_line=src_ln + 1, focus_col=0)
+                self._draft_set_insert_in_codeblock_by_source_offset(cursor_offset)
+                self._update_draft_stats()
+                self._schedule_draft_save()
+                self._draft_markdown_return_handled = True
+                return "break"
+
+            # 常规：回车后自动补齐当前行缩进
+            new_right = right.lstrip(" \t")
+            new_parts = lines[: src_ln - 1] + [left, base_indent + new_right] + lines[src_ln:]
+            self._draft_set_source("\n".join(new_parts), coalesce=False)
+            cursor_offset = self._draft_source_offset_from_line_col(src_ln + 1, len(base_indent))
+            self._draft_refresh_view(focus_line=src_ln + 1, focus_col=0)
+            self._draft_set_insert_in_codeblock_by_source_offset(cursor_offset)
+            self._update_draft_stats()
+            self._schedule_draft_save()
+            self._draft_markdown_return_handled = True
+            return "break"
 
         m_ul = re.match(r"^(\s*)([-*+])\s+(.*)$", line)
         if m_ul:
@@ -1158,6 +1964,45 @@ class DailyTaskAssistant:
         except tk.TclError:
             pass
 
+        # 代码块内容行：禁止直接删除行号前缀（数字/空格）
+        # 若代码行前导缩进被删到空行（仅空白），再按一次 BackSpace 会删除整行
+        try:
+            parts_now = self._draft_source.split("\n")
+            code_rng = self._draft_find_closed_code_block_range_by_line(parts_now, ln)
+        except Exception:
+            code_rng = None
+        if code_rng is not None:
+            s, e = code_rng
+            content_count = max(1, e - s - 1)
+            digits_max = len(str(content_count))
+            prefix_len = digits_max + 1
+
+            # 在“行号前缀区域”内操作：不允许，直接把光标挪回到代码内容起点
+            if col < prefix_len:
+                try:
+                    self.draft_text.mark_set("insert", f"{ln}.{prefix_len}")
+                    self.draft_text.see("insert")
+                except tk.TclError:
+                    pass
+                return "break"
+
+            if ks == "BackSpace":
+                src_col = col - prefix_len
+                i = ln - 1
+                if i < 0 or i >= len(parts_now):
+                    return None
+                # 回退到代码内容起点且该行已经“只有空白” => 删除整行
+                if src_col == 0 and ln > 1 and parts_now[i].strip() == "":
+                    del parts_now[i]
+                    self._draft_set_source("\n".join(parts_now), coalesce=False)
+                    prev_ln = ln - 1
+                    prev_text = parts_now[prev_ln - 1] if 0 <= prev_ln - 1 < len(parts_now) else ""
+                    self._draft_refresh_view(focus_line=prev_ln, focus_col=len(prev_text))
+                    self._draft_markdown_delete_handled = True
+                    return "break"
+            # 其它位置：交给默认 Tk 行编辑 + KeyRelease 同步源码
+            return None
+
         self._draft_sync_line_at(ln)
         lines = self._draft_source.split("\n")
         i = ln - 1
@@ -1189,12 +2034,19 @@ class DailyTaskAssistant:
 
         self._draft_find_var = tk.StringVar()
         self._draft_replace_var = tk.StringVar()
+        self._draft_find_regex_var = tk.BooleanVar(value=False)
 
         row1 = ttk.Frame(self._draft_search_frame, style="Main.TFrame")
         row1.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(row1, text="查找", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self._draft_find_entry = ttk.Entry(row1, textvariable=self._draft_find_var)
         self._draft_find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Checkbutton(
+            row1,
+            text="正则",
+            variable=self._draft_find_regex_var,
+            style="App.TCheckbutton",
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(row1, text="上一个", style="Secondary.TButton", command=lambda: self._draft_find_next(backward=True)).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -1240,6 +2092,8 @@ class DailyTaskAssistant:
 
         self.draft_text.bind("<Control-f>", lambda _e: self._show_draft_search(mode="find"))
         self.draft_text.bind("<Control-h>", lambda _e: self._show_draft_search(mode="replace"))
+        self.draft_text.bind("<Control-v>", self._draft_handle_paste)
+        self.draft_text.bind("<<Paste>>", self._draft_handle_paste)
         self.draft_text.bind("<Escape>", lambda _e: self._draft_escape_handler())
 
         self._draft_find_entry.bind("<Return>", lambda _e: self._draft_find_next(backward=False))
@@ -1248,6 +2102,7 @@ class DailyTaskAssistant:
         self._draft_replace_entry.bind("<Escape>", lambda _e: self._hide_draft_search())
 
         self._draft_find_var.trace_add("write", lambda *_a: self._draft_highlight_all_matches())
+        self._draft_find_regex_var.trace_add("write", lambda *_a: self._draft_highlight_all_matches())
 
         self.draft_text.bind("<KeyPress-Return>", self._draft_handle_return)
         self.draft_text.bind("<KeyPress-KP_Enter>", self._draft_handle_return)
@@ -1257,6 +2112,7 @@ class DailyTaskAssistant:
         self.draft_text.bind("<KeyRelease>", self._draft_on_editor_key_release, add=True)
         self.draft_text.bind("<ButtonRelease-1>", lambda _e: self._draft_on_editor_click(), add=True)
         self.draft_text.bind("<B1-Motion>", self._draft_on_editor_drag_select, add=True)
+        self.draft_text.bind("<KeyPress>", self._draft_on_editor_keypress, add=True)
 
     def _draft_escape_handler(self) -> str | None:
         if getattr(self, "_draft_search_visible", False):
@@ -1363,6 +2219,18 @@ class DailyTaskAssistant:
         self._draft_clear_search_highlight()
         if not needle:
             return
+        if self._draft_find_regex_var.get():
+            pattern = self._draft_compile_find_regex(needle)
+            if pattern is None:
+                return
+            content = self.draft_text.get("1.0", "end-1c")
+            for m in pattern.finditer(content):
+                if m.start() == m.end():
+                    continue
+                idx = f"1.0+{m.start()}c"
+                end = f"1.0+{m.end()}c"
+                self.draft_text.tag_add("draft_find_match", idx, end)
+            return
         start = "1.0"
         try:
             while True:
@@ -1388,17 +2256,44 @@ class DailyTaskAssistant:
         self.draft_text.tag_remove("draft_find_current", "1.0", tk.END)
 
         try:
-            if backward:
-                idx = self.draft_text.search(needle, cur, stopindex="1.0", backwards=True, nocase=False)
-                if not idx:
-                    idx = self.draft_text.search(needle, tk.END, stopindex="1.0", backwards=True, nocase=False)
+            if self._draft_find_regex_var.get():
+                pattern = self._draft_compile_find_regex(needle)
+                if pattern is None:
+                    return "break"
+                content = self.draft_text.get("1.0", "end-1c")
+                matches = [m for m in pattern.finditer(content) if m.start() != m.end()]
+                if not matches:
+                    return "break"
+                cur_off = len(self.draft_text.get("1.0", cur))
+                pick = None
+                if backward:
+                    for m in reversed(matches):
+                        if m.start() < cur_off:
+                            pick = m
+                            break
+                    if pick is None:
+                        pick = matches[-1]
+                else:
+                    for m in matches:
+                        if m.start() > cur_off:
+                            pick = m
+                            break
+                    if pick is None:
+                        pick = matches[0]
+                idx = f"1.0+{pick.start()}c"
+                end = f"1.0+{pick.end()}c"
             else:
-                idx = self.draft_text.search(needle, f"{cur}+1c", stopindex=tk.END, nocase=False)
+                if backward:
+                    idx = self.draft_text.search(needle, cur, stopindex="1.0", backwards=True, nocase=False)
+                    if not idx:
+                        idx = self.draft_text.search(needle, tk.END, stopindex="1.0", backwards=True, nocase=False)
+                else:
+                    idx = self.draft_text.search(needle, f"{cur}+1c", stopindex=tk.END, nocase=False)
+                    if not idx:
+                        idx = self.draft_text.search(needle, "1.0", stopindex=tk.END, nocase=False)
                 if not idx:
-                    idx = self.draft_text.search(needle, "1.0", stopindex=tk.END, nocase=False)
-            if not idx:
-                return "break"
-            end = f"{idx}+{len(needle)}c"
+                    return "break"
+                end = f"{idx}+{len(needle)}c"
             self.draft_text.tag_add("draft_find_current", idx, end)
             self.draft_text.mark_set(tk.INSERT, end)
             self.draft_text.see(idx)
@@ -1416,7 +2311,15 @@ class DailyTaskAssistant:
         try:
             if self.draft_text.tag_ranges(tk.SEL):
                 sel = self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST)
-                if sel == needle:
+                if self._draft_find_regex_var.get():
+                    pattern = self._draft_compile_find_regex(needle)
+                    if pattern is None:
+                        return "break"
+                    if pattern.fullmatch(sel):
+                        new_sel = pattern.sub(repl, sel, count=1)
+                        self.draft_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                        self.draft_text.insert(tk.INSERT, new_sel)
+                elif sel == needle:
                     self.draft_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
                     self.draft_text.insert(tk.INSERT, repl)
             self._draft_find_next(backward=False)
@@ -1435,7 +2338,13 @@ class DailyTaskAssistant:
             return "break"
         try:
             content = self.draft_text.get("1.0", tk.END)
-            new_content = content.replace(needle, repl)
+            if self._draft_find_regex_var.get():
+                pattern = self._draft_compile_find_regex(needle)
+                if pattern is None:
+                    return "break"
+                new_content, _cnt = pattern.subn(repl, content)
+            else:
+                new_content = content.replace(needle, repl)
             if new_content != content:
                 self.draft_text.delete("1.0", tk.END)
                 self.draft_text.insert("1.0", new_content)
@@ -1446,6 +2355,13 @@ class DailyTaskAssistant:
         except tk.TclError:
             pass
         return "break"
+
+    def _draft_compile_find_regex(self, expr: str):
+        try:
+            return re.compile(expr)
+        except re.error:
+            self._record_status("正则表达式无效")
+            return None
 
     def _update_draft_stats(self) -> None:
         if not hasattr(self, "draft_stats_label"):
@@ -1521,7 +2437,6 @@ class DailyTaskAssistant:
         lines = self._format_tasks_lines(selected_day, tasks)
         self._set_log_text("\n".join(lines), preserve_view=False)
         self._weekly_tasks_plain = ""
-        self._update_weekly_prompt_preview("")
 
     def _set_log_text(self, content: str, preserve_view: bool = True) -> None:
         # 自动刷新时尽量保留滚动位置，避免“回到第一页”的观感
@@ -1545,34 +2460,108 @@ class DailyTaskAssistant:
         if self.log_mode_var.get() == "周汇总":
             self.log_date_frame.pack_forget()
             self.log_week_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self.weekly_prompt_frame.pack(fill=tk.X, pady=(8, 0), after=self.log_text)
         else:
             self.log_week_frame.pack_forget()
             self.log_date_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self.weekly_prompt_frame.pack_forget()
 
     def _on_log_mode_changed(self, _event=None) -> None:
         self._apply_log_mode_layout()
         self._reload_log_comboboxes()
         self._refresh_logs_tab_data()
 
+    def _update_log_dropdown_button_labels(self) -> None:
+        mode_text = self.log_mode_var.get().strip() or "单日"
+        self.log_mode_dropdown_btn.configure(text=f"{mode_text} ▼")
+        day_text = self.log_day_var.get().strip() or "请选择日期"
+        self.log_day_dropdown_btn.configure(text=f"{day_text} ▼")
+        week_text = self.log_week_var.get().strip() or "请选择自然周"
+        self.log_week_dropdown_btn.configure(text=f"{week_text} ▼")
+
+    def _toggle_log_dropdown(self, kind: str) -> None:
+        if self._active_log_dropdown_popup is not None and self._active_log_dropdown_popup.winfo_exists():
+            if self._active_log_dropdown_kind == kind:
+                self._hide_log_dropdown()
+                return
+            self._hide_log_dropdown()
+        self._show_log_dropdown(kind)
+
+    def _show_log_dropdown(self, kind: str) -> None:
+        if kind == "mode":
+            options = self._log_mode_values
+            anchor_widget = self.log_mode_dropdown_btn
+        elif kind == "day":
+            options = self._log_day_values
+            anchor_widget = self.log_day_dropdown_btn
+        else:
+            options = self._log_week_values
+            anchor_widget = self.log_week_dropdown_btn
+        if not options:
+            return
+        popup = ttk.Frame(self.root, style="Main.TFrame", padding=4)
+        popup.configure(borderwidth=1, relief="solid")
+        self._active_log_dropdown_popup = popup
+        self._active_log_dropdown_kind = kind
+
+        for opt in options:
+            ttk.Button(
+                popup,
+                text=opt,
+                style="Secondary.TButton",
+                command=lambda value=opt, k=kind: self._select_log_dropdown_option(k, value),
+            ).pack(fill=tk.X, pady=1)
+
+        popup.update_idletasks()
+        bx = anchor_widget.winfo_rootx() - self.root.winfo_rootx()
+        by = anchor_widget.winfo_rooty() - self.root.winfo_rooty() + anchor_widget.winfo_height() + 2
+        popup.place(x=bx, y=by)
+        popup.lift()
+
+    def _select_log_dropdown_option(self, kind: str, value: str) -> None:
+        self._hide_log_dropdown()
+        if kind == "mode":
+            self.log_mode_var.set(value)
+            self._update_log_dropdown_button_labels()
+            self._on_log_mode_changed()
+            return
+        if kind == "day":
+            self.log_day_var.set(value)
+            self._update_log_dropdown_button_labels()
+            self._refresh_logs_tab_data()
+            return
+        self.log_week_var.set(value)
+        self._update_log_dropdown_button_labels()
+        self._refresh_log_week_view()
+
+    def _hide_log_dropdown(self) -> None:
+        if self._active_log_dropdown_popup is None:
+            return
+        try:
+            if self._active_log_dropdown_popup.winfo_exists():
+                self._active_log_dropdown_popup.destroy()
+        except tk.TclError:
+            pass
+        self._active_log_dropdown_popup = None
+        self._active_log_dropdown_kind = None
+
     def _reload_log_comboboxes(self) -> None:
         dates = self._collect_log_dates()
         day_values = dates if dates else [self.today]
-        self.log_day_combo["values"] = day_values
+        self._log_day_values = day_values
         cur_day = self.log_day_var.get().strip()
         if cur_day not in day_values:
             self.log_day_var.set(day_values[0])
+        self._update_log_dropdown_button_labels()
 
         week_opts = self._collect_week_options()
         self._log_week_key_by_label = {lbl: key for key, lbl in week_opts}
         labels = [lbl for _key, lbl in week_opts]
-        self.log_week_combo["values"] = labels
+        self._log_week_values = labels
         cur_week = self.log_week_var.get().strip()
         if not labels:
             self.log_week_var.set("")
         elif cur_week not in labels:
             self.log_week_var.set(labels[0])
+        self._update_log_dropdown_button_labels()
 
     def _collect_week_options(self) -> list[tuple[str, str]]:
         today = datetime.now().date()
@@ -1600,7 +2589,6 @@ class DailyTaskAssistant:
         if not key:
             self._weekly_tasks_plain = ""
             self._set_log_text("暂无周数据，请先选择自然周。", preserve_view=False)
-            self._update_weekly_prompt_preview("")
             return
         mon_str, sun_str = key.split("|", 1)
         start = datetime.strptime(mon_str, DATE_FMT).date()
@@ -1623,13 +2611,10 @@ class DailyTaskAssistant:
             full_prompt = self._get_weekly_prompt_template().format(tasks_block=self._weekly_tasks_plain)
         except (KeyError, ValueError):
             full_prompt = self._get_weekly_prompt_template().replace("{tasks_block}", self._weekly_tasks_plain)
-        self._update_weekly_prompt_preview(full_prompt)
+        _ = full_prompt
 
     def _update_weekly_prompt_preview(self, text: str) -> None:
-        self.weekly_prompt_preview.configure(state=tk.NORMAL)
-        self.weekly_prompt_preview.delete("1.0", tk.END)
-        self.weekly_prompt_preview.insert("1.0", text or "（切换到「周汇总」并选择周后，此处显示可复制提示词预览）")
-        self.weekly_prompt_preview.configure(state=tk.DISABLED)
+        _ = text
 
     def _copy_weekly_ai_prompt(self) -> None:
         if self.log_mode_var.get() != "周汇总" or not self._weekly_tasks_plain.strip():
@@ -1809,6 +2794,48 @@ class DailyTaskAssistant:
         self._sort_tasks()
         self._save_today_tasks()
 
+    def _rollover_day_if_needed(self) -> None:
+        current_day = datetime.now().strftime(DATE_FMT)
+        if current_day == self.today:
+            return
+
+        previous_day = self.today
+        previous_tasks = list(self.tasks)
+        self._flush_incremental_log(force=True)
+        if previous_tasks and not self._is_day_archived(previous_day):
+            self._archive_yesterday(previous_day, previous_tasks)
+
+        carry_over = [
+            TaskItem(
+                id=str(uuid.uuid4()),
+                text=item.text,
+                done=False,
+                created_at=datetime.now().strftime(TIME_FMT),
+                source_day=previous_day,
+            )
+            for item in previous_tasks
+            if not item.done
+        ]
+
+        self.today = current_day
+        self.today_file = self.data_dir / f"tasks_{self.today}.json"
+        self.incremental_log_file = self.logs_dir / f"incremental_{self.today}.jsonl"
+        self.tasks = carry_over
+        self._sort_tasks()
+        self._save_today_tasks()
+        self.pending_events.clear()
+        self._append_event(
+            "rollover_to_new_day",
+            {
+                "from_day": previous_day,
+                "to_day": current_day,
+                "carried_count": len(carry_over),
+            },
+        )
+        if hasattr(self, "log_day_var"):
+            self.log_day_var.set(self.today)
+        self._record_status(f"检测到跨日：已归档 {previous_day}，并迁移未完成任务 {len(carry_over)} 项")
+
     def _archive_yesterday(self, day: str, tasks: list[TaskItem]) -> None:
         archive_event = {
             "ts": datetime.now().strftime(TIME_FMT),
@@ -1822,6 +2849,7 @@ class DailyTaskAssistant:
         self._append_jsonl(self.daily_archive_log_file, archive_event)
 
     def _add_task(self) -> None:
+        self._rollover_day_if_needed()
         text = self.task_entry.get().strip()
         if not text:
             messagebox.showwarning("提示", "请输入任务内容")
@@ -1863,8 +2891,55 @@ class DailyTaskAssistant:
             self.root.bind_all(tab_seq, self._switch_tab_by_shortcut)
             for cls in ("TEntry", "Entry", "Text", "TCombobox"):
                 self.root.bind_class(cls, tab_seq, self._switch_tab_by_shortcut)
+        self._setup_draft_tool_shortcuts()
 
-    def _switch_tab_by_shortcut(self, _event=None) -> str:
+    def _setup_draft_tool_shortcuts(self) -> None:
+        for seq in getattr(self, "_draft_tool_shortcut_seqs", {}).values():
+            if not seq:
+                continue
+            try:
+                self.root.unbind_all(seq)
+            except tk.TclError:
+                pass
+            for cls in ("TEntry", "Entry", "Text", "TCombobox"):
+                try:
+                    self.root.unbind_class(cls, seq)
+                except tk.TclError:
+                    pass
+
+        tool_config = {
+            "json": ("tool_json_hotkey", self._draft_format_json),
+            "b64_encode": ("tool_b64_encode_hotkey", self._draft_base64_encode),
+            "b64_decode": ("tool_b64_decode_hotkey", self._draft_base64_decode),
+            "url_encode": ("tool_url_encode_hotkey", self._draft_url_encode),
+            "url_decode": ("tool_url_decode_hotkey", self._draft_url_decode),
+        }
+        self._draft_tool_shortcut_seqs = {}
+        for key, (setting_name, callback) in tool_config.items():
+            hotkey = str(self.settings.get(setting_name, "")).strip().upper()
+            seq = self._hotkey_to_tk_sequence(hotkey) if hotkey else None
+            self._draft_tool_shortcut_seqs[key] = seq
+            if not seq:
+                continue
+            handler = self._make_local_shortcut_handler(callback)
+            self.root.bind_all(seq, handler)
+            for cls in ("TEntry", "Entry", "Text", "TCombobox"):
+                self.root.bind_class(cls, seq, handler)
+
+    def _make_local_shortcut_handler(self, callback):
+        def handler(_event=None):
+            if not self._is_app_focused():
+                return None
+            if self.notebook.select() != str(self.draft_tab):
+                return None
+            callback()
+            return "break"
+
+        return handler
+
+    def _switch_tab_by_shortcut(self, _event=None) -> str | None:
+        if not self._is_app_focused():
+            return None
         tabs = self.notebook.tabs()
         if not tabs:
             return "break"
@@ -1918,7 +2993,7 @@ class DailyTaskAssistant:
     def _focus_input_from_shortcut(self, event=None) -> str | None:
         if event is None:
             return None
-        if not self.root.winfo_viewable():
+        if not self._is_app_focused():
             return None
         # 在任何可编辑输入控件中输入字符时，不触发“聚焦任务输入框”，避免草稿等页面输入 '/' 被打断
         try:
@@ -1945,7 +3020,16 @@ class DailyTaskAssistant:
             return event.char.lower()
         return event.keysym.lower()
 
+    def _is_app_focused(self) -> bool:
+        if not self.root.winfo_viewable():
+            return False
+        try:
+            return self.root.focus_displayof() is not None
+        except tk.TclError:
+            return False
+
     def _on_toggle_task(self, task_id: str) -> None:
+        self._rollover_day_if_needed()
         task = next((t for t in self.tasks if t.id == task_id), None)
         if task is None:
             return
@@ -2108,6 +3192,7 @@ class DailyTaskAssistant:
         self._refresh_task_list()
 
     def _save_inline_edit(self, task_id: str, new_text_raw: str) -> None:
+        self._rollover_day_if_needed()
         task = next((t for t in self.tasks if t.id == task_id), None)
         if task is None:
             self.inline_editing_task_id = None
@@ -2139,6 +3224,7 @@ class DailyTaskAssistant:
         self._record_status("任务内容已修改")
 
     def _delete_task(self, task_id: str) -> None:
+        self._rollover_day_if_needed()
         task = next((t for t in self.tasks if t.id == task_id), None)
         if task is None:
             return
@@ -2305,6 +3391,7 @@ class DailyTaskAssistant:
         messagebox.showinfo("已复制", "日志路径已复制到剪贴板")
 
     def _schedule_incremental_flush(self) -> None:
+        self._rollover_day_if_needed()
         self._flush_incremental_log(force=False)
         self.root.after(LOG_FLUSH_INTERVAL_MS, self._schedule_incremental_flush)
 
@@ -2313,6 +3400,9 @@ class DailyTaskAssistant:
         self.status_label.configure(text=f"[{now}] {text}")
 
     def _on_close(self) -> None:
+        self._rollover_day_if_needed()
+        self._hide_draft_tools_popup()
+        self._hide_log_dropdown()
         if self._alpha_save_after_id is not None:
             self.root.after_cancel(self._alpha_save_after_id)
             self._alpha_save_after_id = None
@@ -2337,6 +3427,11 @@ class DailyTaskAssistant:
             "global_toggle_hotkey": "CTRL+ALT+T",
             "focus_input_key": "/",
             "tab_switch_hotkey": "CTRL+TAB",
+            "tool_json_hotkey": "CTRL+ALT+J",
+            "tool_b64_encode_hotkey": "CTRL+ALT+E",
+            "tool_b64_decode_hotkey": "CTRL+ALT+D",
+            "tool_url_encode_hotkey": "CTRL+ALT+U",
+            "tool_url_decode_hotkey": "CTRL+ALT+I",
             "window_alpha": 0.88,
         }
         if not self.settings_file.exists():
@@ -2487,13 +3582,35 @@ class DailyTaskAssistant:
         new_global: str,
         new_focus: str,
         new_tab: str,
+        new_tool_json: str | None = None,
+        new_tool_b64_encode: str | None = None,
+        new_tool_b64_decode: str | None = None,
+        new_tool_url_encode: str | None = None,
+        new_tool_url_decode: str | None = None,
     ) -> None:
         if not new_global or not new_focus or not new_tab:
+            return
+        if new_tool_json is None:
+            new_tool_json = str(self.settings.get("tool_json_hotkey", "CTRL+ALT+J")).strip().upper()
+        if new_tool_b64_encode is None:
+            new_tool_b64_encode = str(self.settings.get("tool_b64_encode_hotkey", "CTRL+ALT+E")).strip().upper()
+        if new_tool_b64_decode is None:
+            new_tool_b64_decode = str(self.settings.get("tool_b64_decode_hotkey", "CTRL+ALT+D")).strip().upper()
+        if new_tool_url_encode is None:
+            new_tool_url_encode = str(self.settings.get("tool_url_encode_hotkey", "CTRL+ALT+U")).strip().upper()
+        if new_tool_url_decode is None:
+            new_tool_url_decode = str(self.settings.get("tool_url_decode_hotkey", "CTRL+ALT+I")).strip().upper()
+        if not (new_tool_json and new_tool_b64_encode and new_tool_b64_decode and new_tool_url_encode and new_tool_url_decode):
             return
         if (
             new_global == self.settings.get("global_toggle_hotkey", "")
             and new_focus == self.settings.get("focus_input_key", "")
             and new_tab == self.settings.get("tab_switch_hotkey", "")
+            and new_tool_json == self.settings.get("tool_json_hotkey", "")
+            and new_tool_b64_encode == self.settings.get("tool_b64_encode_hotkey", "")
+            and new_tool_b64_decode == self.settings.get("tool_b64_decode_hotkey", "")
+            and new_tool_url_encode == self.settings.get("tool_url_encode_hotkey", "")
+            and new_tool_url_decode == self.settings.get("tool_url_decode_hotkey", "")
         ):
             return
         if self._parse_hotkey(new_global) is None:
@@ -2502,24 +3619,51 @@ class DailyTaskAssistant:
         if self._hotkey_to_tk_sequence(new_tab) is None:
             messagebox.showwarning("提示", "Tab 切换快捷键格式无效", parent=self.root)
             return
+        for label, hotkey in (
+            ("JSON 格式化", new_tool_json),
+            ("Base64 编码", new_tool_b64_encode),
+            ("Base64 解码", new_tool_b64_decode),
+            ("URL 编码", new_tool_url_encode),
+            ("URL 解码", new_tool_url_decode),
+        ):
+            if self._hotkey_to_tk_sequence(hotkey) is None:
+                messagebox.showwarning("提示", f"{label} 快捷键格式无效", parent=self.root)
+                return
         self.settings["global_toggle_hotkey"] = new_global
         self.settings["focus_input_key"] = new_focus
         self.settings["tab_switch_hotkey"] = new_tab
+        self.settings["tool_json_hotkey"] = new_tool_json
+        self.settings["tool_b64_encode_hotkey"] = new_tool_b64_encode
+        self.settings["tool_b64_decode_hotkey"] = new_tool_b64_decode
+        self.settings["tool_url_encode_hotkey"] = new_tool_url_encode
+        self.settings["tool_url_decode_hotkey"] = new_tool_url_decode
         self.settings_file.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
         self._setup_shortcuts()
         self._register_global_hotkey()
         self._record_status("快捷键设置已自动保存")
 
     def _record_hotkey_into_entry(self, entry: ttk.Entry, mode: str) -> None:
-        for e in (self.global_hotkey_entry, self.focus_key_entry, self.tab_key_entry):
+        all_entries = [
+            self.global_hotkey_entry,
+            self.focus_key_entry,
+            self.tab_key_entry,
+            getattr(self, "tool_json_hotkey_entry", None),
+            getattr(self, "tool_b64_encode_hotkey_entry", None),
+            getattr(self, "tool_b64_decode_hotkey_entry", None),
+            getattr(self, "tool_url_encode_hotkey_entry", None),
+            getattr(self, "tool_url_decode_hotkey_entry", None),
+        ]
+        for e in all_entries:
+            if e is None:
+                continue
             e.unbind("<KeyPress>")
-        tip = "请按一个组合键..." if mode in {"global", "tab"} else "请按一个按键..."
+        tip = "请按一个组合键..." if mode in {"global", "tab", "combo"} else "请按一个按键..."
         self._record_status(tip)
         entry.focus_set()
         entry.icursor(tk.END)
 
         def on_key(event) -> str:
-            if mode in {"global", "tab"}:
+            if mode in {"global", "tab", "combo"}:
                 hotkey = self._build_global_hotkey_text_from_event(event)
                 if not hotkey:
                     return "break"
@@ -2532,26 +3676,31 @@ class DailyTaskAssistant:
                 entry.delete(0, tk.END)
                 entry.insert(0, key_text)
             entry.unbind("<KeyPress>")
-            current_global = self.settings.get("global_toggle_hotkey", "CTRL+ALT+T")
-            current_focus = self.settings.get("focus_input_key", "/")
-            current_tab = self.settings.get("tab_switch_hotkey", "CTRL+TAB")
-            if mode == "global":
-                new_global = entry.get().strip().upper()
-                new_focus = current_focus
-                new_tab = current_tab
-            elif mode == "tab":
-                new_global = current_global
-                new_focus = current_focus
-                new_tab = entry.get().strip().upper()
-            else:
-                new_global = current_global
-                new_focus = entry.get().strip()
-                new_tab = current_tab
-            self._apply_settings_changes(new_global, new_focus, new_tab)
+            self._save_shortcut_settings_from_entries()
             self._record_status("按键录制完成")
             return "break"
 
         entry.bind("<KeyPress>", on_key)
+
+    def _save_shortcut_settings_from_entries(self) -> None:
+        new_global = self.global_hotkey_entry.get().strip().upper()
+        new_focus = self.focus_key_entry.get().strip()
+        new_tab = self.tab_key_entry.get().strip().upper()
+        new_tool_json = self.tool_json_hotkey_entry.get().strip().upper()
+        new_tool_b64_encode = self.tool_b64_encode_hotkey_entry.get().strip().upper()
+        new_tool_b64_decode = self.tool_b64_decode_hotkey_entry.get().strip().upper()
+        new_tool_url_encode = self.tool_url_encode_hotkey_entry.get().strip().upper()
+        new_tool_url_decode = self.tool_url_decode_hotkey_entry.get().strip().upper()
+        self._apply_settings_changes(
+            new_global,
+            new_focus,
+            new_tab,
+            new_tool_json,
+            new_tool_b64_encode,
+            new_tool_b64_decode,
+            new_tool_url_encode,
+            new_tool_url_decode,
+        )
 
     def _build_global_hotkey_text_from_event(self, event) -> str | None:
         mods = []
@@ -2631,6 +3780,18 @@ class DailyTaskAssistant:
             "App.TRadiobutton",
             background=[("active", bg_main), ("selected", bg_main)],
             foreground=[("active", accent_h), ("selected", fg)],
+        )
+        style.configure(
+            "App.TCheckbutton",
+            background=bg_main,
+            foreground=fg_muted,
+            font=UI_FONT_SM,
+            focuscolor=accent,
+        )
+        style.map(
+            "App.TCheckbutton",
+            background=[("active", bg_main), ("selected", bg_main)],
+            foreground=[("active", fg), ("selected", fg)],
         )
 
         style.configure(
@@ -2835,6 +3996,14 @@ class DailyTaskAssistant:
 
 
 def main() -> None:
+    if not _acquire_single_instance_lock():
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "每日任务助手已在运行，无需重复启动。",
+            "启动提示",
+            0x00000040,
+        )
+        return
     root = tk.Tk()
     DailyTaskAssistant(root)
     root.mainloop()
