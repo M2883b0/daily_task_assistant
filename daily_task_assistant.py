@@ -1,5 +1,6 @@
 import json
 import re
+import difflib
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -115,8 +116,10 @@ class DailyTaskAssistant:
         self._draft_refreshing = False
         self._draft_force_raw = False
         self._draft_last_nav_line: int | None = None
+        self._draft_active_raw_line: int | None = None
         self._draft_return_press_col: int | None = None
         self._draft_markdown_return_handled: bool = False
+        self._draft_markdown_delete_handled: bool = False
 
         self._build_ui()
         self._load_tasks_for_today()
@@ -731,6 +734,9 @@ class DailyTaskAssistant:
         if self._draft_force_raw:
             self._draft_source = self.draft_text.get("1.0", "end-1c")
             return
+        # 混合渲染模式下仅允许从“当前源码行”回写，避免把渲染文本覆盖进 Markdown 源码
+        if line_1based != getattr(self, "_draft_active_raw_line", None):
+            return
         if line_1based < 1:
             return
         parts = self._draft_source.split("\n")
@@ -771,6 +777,82 @@ class DailyTaskAssistant:
             return
         parts.extend([""] * delta)
         self._draft_source = "\n".join(parts)
+
+    def _draft_source_offset_from_line_col(self, line_1based: int, col: int) -> int:
+        parts = self._draft_source.split("\n")
+        if not parts:
+            return 0
+        ln = max(1, min(int(line_1based), len(parts)))
+        offset = 0
+        for i in range(ln - 1):
+            offset += len(parts[i]) + 1
+        c = max(0, min(int(col), len(parts[ln - 1])))
+        return offset + c
+
+    def _draft_source_line_col_from_offset(self, offset: int) -> tuple[int, int]:
+        parts = self._draft_source.split("\n")
+        if not parts:
+            return 1, 0
+        rem = max(0, min(int(offset), len(self._draft_source)))
+        for i, line in enumerate(parts):
+            if rem <= len(line):
+                return i + 1, rem
+            rem -= len(line)
+            if i < len(parts) - 1:
+                if rem == 0:
+                    return i + 2, 0
+                rem -= 1
+        return len(parts), len(parts[-1])
+
+    def _draft_line_view_to_source_col(self, line_1based: int, view_col: int) -> int:
+        parts = self._draft_source.split("\n")
+        if not parts:
+            return 0
+        ln = max(1, min(int(line_1based), len(parts)))
+        src = parts[ln - 1]
+        try:
+            view = self.draft_text.get(f"{ln}.0", f"{ln}.end")
+        except tk.TclError:
+            return max(0, min(int(view_col), len(src)))
+        if view == src:
+            return max(0, min(int(view_col), len(src)))
+
+        char_map = [0] * len(view)
+        matcher = difflib.SequenceMatcher(a=view, b=src, autojunk=False)
+        for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+            if tag == "equal":
+                for i in range(a2 - a1):
+                    char_map[a1 + i] = b1 + i
+            elif tag in ("replace", "insert"):
+                span = max(1, b2 - b1)
+                for i in range(a2 - a1):
+                    char_map[a1 + i] = b1 + min(i, span - 1)
+        if not char_map:
+            return 0
+
+        boundaries = [0] * (len(view) + 1)
+        boundaries[0] = char_map[0]
+        for i in range(1, len(view)):
+            boundaries[i] = char_map[i]
+        boundaries[len(view)] = min(len(src), char_map[-1] + 1)
+        for i in range(1, len(boundaries)):
+            if boundaries[i] < boundaries[i - 1]:
+                boundaries[i] = boundaries[i - 1]
+        for i in range(len(boundaries)):
+            boundaries[i] = max(0, min(boundaries[i], len(src)))
+
+        vc = max(0, min(int(view_col), len(view)))
+        return boundaries[vc]
+
+    def _draft_view_index_to_source_offset(self, index: str) -> int:
+        try:
+            ln_s, col_s = index.split(".")
+            ln = int(ln_s)
+            col = int(col_s)
+        except Exception:
+            return 0
+        src_col = self._draft_line_view_to_source_col(ln, col)
+        return self._draft_source_offset_from_line_col(ln, src_col)
 
     def _draft_refresh_view(self, focus_line: int | None = None, focus_col: int | None = None) -> None:
         if not hasattr(self, "draft_text"):
@@ -834,6 +916,12 @@ class DailyTaskAssistant:
             self.draft_text.mark_set("insert", f"{line_no}.{col}")
             self.draft_text.see("insert")
             self._draft_last_nav_line = line_no
+            self._draft_active_raw_line = line_no
+            try:
+                # 渲染层重绘后清除 modified 标记；后续仅在真实输入后才允许回写源码层
+                self.draft_text.edit_modified(False)
+            except tk.TclError:
+                pass
         finally:
             try:
                 self.draft_text.configure(undo=prev_undo)
@@ -846,6 +934,10 @@ class DailyTaskAssistant:
             return
         if self._draft_force_raw:
             self._draft_source = self.draft_text.get("1.0", "end-1c")
+            try:
+                self.draft_text.edit_modified(False)
+            except tk.TclError:
+                pass
             self._update_draft_stats()
             self._schedule_draft_save()
             return
@@ -866,29 +958,79 @@ class DailyTaskAssistant:
             self._schedule_draft_save()
             self._draft_return_press_col = None
             return
-        self._draft_ensure_source_line_count_from_widget()
+        if (
+            not self._draft_force_raw
+            and ks in ("BackSpace", "Delete")
+            and getattr(self, "_draft_markdown_delete_handled", False)
+        ):
+            self._draft_markdown_delete_handled = False
+            try:
+                cur = int(self.draft_text.index("insert").split(".")[0])
+            except tk.TclError:
+                return
+            self._draft_last_nav_line = cur
+            self._update_draft_stats()
+            self._schedule_draft_save()
+            return
+
         try:
-            cur = int(self.draft_text.index("insert").split(".")[0])
+            idx = self.draft_text.index("insert")
+            cur = int(idx.split(".")[0])
+            col = int(idx.split(".")[1])
         except tk.TclError:
             return
-        prev = self._draft_last_nav_line
-        if prev is None:
-            prev = cur
-        if prev != cur:
-            self._draft_sync_line_at(prev)
-            self._draft_last_nav_line = cur
-            self._draft_refresh_view()
+
+        # 只有真实文本修改才回写源码层；点击/选择/移动光标不写源码
+        try:
+            modified = bool(self.draft_text.edit_modified())
+        except tk.TclError:
+            modified = False
+
+        if modified:
+            self._draft_ensure_source_line_count_from_widget()
+            active_line = self._draft_active_raw_line if self._draft_active_raw_line is not None else cur
+            self._draft_sync_line_at(active_line)
+
+        # 行切换只做渲染层切换，源码层不参与（除非上面 modified=True 且已写回 active 行）
+        active_line = self._draft_active_raw_line if self._draft_active_raw_line is not None else cur
+        if cur != active_line:
+            self._draft_refresh_view(focus_line=cur, focus_col=col)
         else:
-            self._draft_sync_line_at(cur)
             self._draft_last_nav_line = cur
+            self._draft_active_raw_line = cur
+            if modified:
+                try:
+                    self.draft_text.edit_modified(False)
+                except tk.TclError:
+                    pass
         self._update_draft_stats()
         self._schedule_draft_save()
         if ks in ("Return", "KP_Enter"):
             self._draft_return_press_col = None
 
     def _draft_on_editor_click(self, _event=None) -> None:
-        # 延后到 idle 再同步/重绘，避免点击瞬间与本次事件重入叠加造成闪动
-        self.root.after_idle(lambda: self._draft_on_editor_key_release(None))
+        # 鼠标选择场景延后处理，避免在 ButtonRelease 事件栈内重绘导致选区丢失
+        self.root.after_idle(self._draft_after_pointer_release)
+
+    def _draft_after_pointer_release(self) -> None:
+        if self._draft_refreshing:
+            return
+        # 有选区时只更新统计，不触发 sync/refresh；否则会 delete/insert 清空选区
+        try:
+            has_sel = bool(self.draft_text.tag_ranges(tk.SEL))
+        except tk.TclError:
+            has_sel = False
+        if has_sel:
+            self._update_draft_stats()
+            return
+        self._draft_on_editor_key_release(None)
+
+    def _draft_on_editor_drag_select(self, _event=None) -> None:
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                self._update_draft_stats()
+        except tk.TclError:
+            pass
 
     def _draft_handle_return(self, _event=None) -> str | None:
         if self._draft_force_raw:
@@ -949,6 +1091,65 @@ class DailyTaskAssistant:
         self._draft_refresh_view(focus_line=ln + 1, focus_col=0)
         self._draft_markdown_return_handled = True
         return "break"
+
+    def _draft_handle_backspace_delete(self, event=None) -> str | None:
+        if self._draft_force_raw:
+            return None
+        self._draft_markdown_delete_handled = False
+        ks = event.keysym if event is not None else ""
+        if ks not in ("BackSpace", "Delete"):
+            return None
+        try:
+            idx = self.draft_text.index("insert")
+            ln_s, col_s = idx.split(".")
+            ln = int(ln_s)
+            col = int(col_s)
+        except tk.TclError:
+            return None
+        # 选区删除：先把显示层选区还原到源码层偏移，再在 _draft_source 上做原子删除
+        try:
+            if self.draft_text.tag_ranges(tk.SEL):
+                sel_first = self.draft_text.index(tk.SEL_FIRST)
+                sel_last = self.draft_text.index(tk.SEL_LAST)
+                if self.draft_text.compare(sel_first, ">", sel_last):
+                    sel_first, sel_last = sel_last, sel_first
+                src_start = self._draft_view_index_to_source_offset(sel_first)
+                src_end = self._draft_view_index_to_source_offset(sel_last)
+                if src_start > src_end:
+                    src_start, src_end = src_end, src_start
+                if src_end > src_start:
+                    self._draft_source = self._draft_source[:src_start] + self._draft_source[src_end:]
+                    focus_ln, focus_col = self._draft_source_line_col_from_offset(src_start)
+                    self._draft_refresh_view(focus_line=focus_ln, focus_col=focus_col)
+                    self._draft_markdown_delete_handled = True
+                    return "break"
+                return "break"
+        except tk.TclError:
+            pass
+
+        self._draft_sync_line_at(ln)
+        lines = self._draft_source.split("\n")
+        i = ln - 1
+        if i < 0 or i >= len(lines):
+            return None
+
+        if ks == "BackSpace" and col == 0 and ln > 1:
+            prev_text = lines[i - 1]
+            lines[i - 1] = prev_text + lines[i]
+            del lines[i]
+            self._draft_source = "\n".join(lines)
+            self._draft_refresh_view(focus_line=ln - 1, focus_col=len(prev_text))
+            self._draft_markdown_delete_handled = True
+            return "break"
+
+        if ks == "Delete" and col == len(lines[i]) and ln < len(lines):
+            lines[i] = lines[i] + lines[i + 1]
+            del lines[i + 1]
+            self._draft_source = "\n".join(lines)
+            self._draft_refresh_view(focus_line=ln, focus_col=col)
+            self._draft_markdown_delete_handled = True
+            return "break"
+        return None
 
     def _setup_draft_editor_features(self, draft_frame: ttk.Frame) -> None:
         th = APP_THEME
@@ -1019,9 +1220,12 @@ class DailyTaskAssistant:
 
         self.draft_text.bind("<KeyPress-Return>", self._draft_handle_return)
         self.draft_text.bind("<KeyPress-KP_Enter>", self._draft_handle_return)
+        self.draft_text.bind("<KeyPress-BackSpace>", self._draft_handle_backspace_delete)
+        self.draft_text.bind("<KeyPress-Delete>", self._draft_handle_backspace_delete)
 
         self.draft_text.bind("<KeyRelease>", self._draft_on_editor_key_release, add=True)
         self.draft_text.bind("<ButtonRelease-1>", lambda _e: self._draft_on_editor_click(), add=True)
+        self.draft_text.bind("<B1-Motion>", self._draft_on_editor_drag_select, add=True)
 
     def _draft_escape_handler(self) -> str | None:
         if getattr(self, "_draft_search_visible", False):
@@ -1225,17 +1429,12 @@ class DailyTaskAssistant:
             except tk.TclError:
                 content = self._draft_source
         else:
-            try:
-                ln = int(self.draft_text.index("insert").split(".")[0])
-                self._draft_sync_line_at(ln)
-            except tk.TclError:
-                pass
             content = self._draft_source
         char_count = len(re.sub(r"\s+", "", content))
         selected_count = 0
         try:
             if hasattr(self, "draft_text") and self.draft_text.tag_ranges(tk.SEL):
-                selected_count = len(self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST))
+                selected_count = len(re.sub(r"\s+", "", self.draft_text.get(tk.SEL_FIRST, tk.SEL_LAST)))
         except tk.TclError:
             selected_count = 0
         self.draft_stats_label.configure(text=f"源码字数：{char_count}  选中：{selected_count}")
